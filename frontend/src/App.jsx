@@ -7,7 +7,8 @@ const API = 'http://localhost:5000';
 
 export default function App() {
   const [url, setUrl] = useState('');
-  const [workers, setWorkers] = useState(20);
+  const [workers, setWorkers] = useState(8);
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const [logs, setLogs] = useState([]);
   const [progress, setProgress] = useState({ current: 0, total: 0, eta: 0 });
   const [products, setProducts] = useState([]);
@@ -175,8 +176,16 @@ export default function App() {
     } catch {}
   };
 
-  const startScrape = async (e) => {
+  // Submitting the form only asks for confirmation — a scrape is a long, heavy
+  // job, and pressing Enter in the URL box used to launch one instantly.
+  const requestScrape = (e) => {
     e.preventDefault();
+    if (scraping || loading) return;
+    setConfirmOpen(true);
+  };
+
+  const startScrape = async () => {
+    setConfirmOpen(false);
     setLoading(true);
     try {
       const res = await fetch(`${API}/api/scrape`, {
@@ -362,10 +371,10 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-4 flex-1 justify-end ml-4">
-             <form onSubmit={startScrape} className="flex items-center gap-2 flex-1 max-w-4xl justify-end">
+             <form onSubmit={requestScrape} className="flex items-center gap-2 flex-1 max-w-4xl justify-end">
                 <input
                   type="text"
-                  placeholder="Target URL (leave blank for all)"
+                  placeholder="Store URL — whole catalogue is crawled (blank = PhonePlaceKenya)"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                   disabled={scraping}
@@ -815,6 +824,53 @@ export default function App() {
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Scrape Confirmation */}
+      {confirmOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setConfirmOpen(false)}>
+          <div className="bg-white dark:bg-[#0e1726] rounded-lg shadow-xl w-full max-w-lg flex flex-col overflow-hidden animate-[scaleIn_0.2s_ease-out]" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-3 px-6 py-4 border-b border-white-light dark:border-[#1b2e4b]">
+              <div className="w-10 h-10 rounded-full bg-warning/10 text-warning flex items-center justify-center flex-none">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <h3 className="text-lg font-bold text-black dark:text-white">Start scraping?</h3>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <p className="text-[#888ea8] leading-relaxed">
+                The entire product catalogue of the target store will be discovered via its
+                sitemaps and downloaded, including images. This can take a while and makes
+                many requests to the site.
+              </p>
+
+              <div className="rounded-md border border-white-light dark:border-[#1b2e4b] divide-y divide-white-light dark:divide-[#1b2e4b]">
+                <div className="flex items-start justify-between gap-4 px-4 py-3">
+                  <span className="text-xs font-bold text-[#888ea8] uppercase tracking-wider flex-none pt-0.5">Target</span>
+                  <span className="text-black dark:text-white font-semibold text-sm text-right break-all">
+                    {url || 'PhonePlaceKenya (default)'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-4 px-4 py-3">
+                  <span className="text-xs font-bold text-[#888ea8] uppercase tracking-wider">Concurrent workers</span>
+                  <span className="text-black dark:text-white font-semibold text-sm">{workers}</span>
+                </div>
+              </div>
+
+              <p className="text-xs text-[#888ea8]">
+                Products already scraped are skipped automatically, so it's safe to re-run
+                this to fill in anything that failed.
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-2 px-6 py-4 border-t border-white-light dark:border-[#1b2e4b]">
+              <button onClick={() => setConfirmOpen(false)} className="btn btn-outline-secondary">Cancel</button>
+              <button onClick={startScrape} className="btn btn-primary gap-2">
+                <PlayCircle className="w-4 h-4" /> Start Scraping
+              </button>
             </div>
           </div>
         </div>

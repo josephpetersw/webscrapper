@@ -139,7 +139,7 @@ def trigger_scrape():
     req_data = request.json or {}
     url = req_data.get('url')
     limit = req_data.get('limit')
-    workers = req_data.get('workers', 20)
+    workers = req_data.get('workers', 8)
 
     cmd = [VENV_PYTHON, MAIN_SCRIPT]
     if url:

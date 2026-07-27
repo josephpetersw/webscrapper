@@ -33,8 +33,11 @@ GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
 
 **Scraper** — `main.py` + `scraper/` package
 - `scraper/client.py` — `ScraperClient`: sync and async page fetchers via
-  `curl_cffi`, Chrome impersonation, 30s timeout, logs and swallows errors
-  (returns `None` on failure rather than raising).
+  `curl_cffi`, Chrome impersonation, 30s timeout. Retries transient failures
+  3× with linear backoff; statuses in `PERMANENT_STATUSES` (404, 403, 410, …)
+  short-circuit immediately since retrying can't help. Never raises — the
+  sync `fetch_page` returns `None`, the async `fetch_page_async` returns
+  `(None, reason)` so callers can record *why* a URL was missed.
 - `scraper/parser.py` — `Parser`: pure static methods, no I/O. Parses sitemap
   XML for `<loc>` URLs, and parses a WooCommerce product page's HTML into a
   dict (title, short/long description, categories via breadcrumbs, brand
@@ -46,15 +49,44 @@ GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
 - `scraper/downloader.py` — `ImageDownloader`: async image downloads with a
   semaphore for concurrency control, skips files that already exist on disk
   (resumable).
-- `main.py` — orchestrates: fetch sitemap index → filter product sitemaps →
-  collect product URLs → scrape concurrently with `asyncio` + a
-  `Semaphore(workers)` → write `data/structured/<category>/<product>/` with
-  `data.json`, `description.md`, `short_description.txt`, `images/`. Also
-  periodically flushes `data/products.json` / `data/categories.json` (every
-  10 products, plus a final write). Progress is written to
-  `data/progress.json` (`{current, total, eta}`) — this is what the frontend
-  polls for the live progress bar. Logs go to both stdout and `scraper.log`.
-  Runs as a CLI: `python main.py --target_url URL --limit N --workers 20`.
+- `main.py` — orchestrates: discover product URLs → scrape concurrently with
+  `asyncio` + a `Semaphore(workers)` → write
+  `data/structured/<category>/<product>/` with `data.json`, `description.md`,
+  `short_description.txt`, `images/`. Flushes `products.json` /
+  `categories.json` / `failed_urls.json` every 10 completions plus a final
+  write. Progress goes to `data/progress.json` (`{current, total, eta}`),
+  which the frontend polls for the live progress bar. Logs to stdout and
+  `scraper.log`. CLI:
+  `python main.py --target_url URL --limit N --workers 8 [--no-resume] [--single-product]`.
+
+  **Site discovery (`discover_product_urls`)** — works against any
+  WordPress/WooCommerce store, not just the default one. Reads `robots.txt`
+  for `Sitemap:` directives, falls back to the conventional locations
+  (`/sitemap_index.xml`, `/sitemap.xml`, `/wp-sitemap.xml`,
+  `/product-sitemap.xml`), then walks sitemap *indexes* down to leaf
+  sitemaps. If any leaf sitemap is name-identified as a product sitemap, only
+  those are trusted; URL-pattern matching is a fallback for stores whose
+  sitemaps aren't helpfully named. Two traps worth knowing, both already
+  handled and easy to reintroduce:
+    - **Never put `'item'` in `PRODUCT_SITEMAP_HINTS`** — the word "sitemap"
+      itself contains "item", so it matches every sitemap on the site.
+    - `product_cat-`, `product_tag-`, `pa_*-` sitemaps list category / tag /
+      attribute *archive* pages, not products; `TAXONOMY_SITEMAP_HINTS`
+      excludes them. Likewise `/shop/` and `/store/` are deliberately absent
+      from `PRODUCT_URL_HINTS` (they match catalogue indexes far more often
+      than products).
+
+  **Resume** is on by default: `load_existing_products()` reads the previous
+  `products.json` and skips URLs already scraped, so a re-run fills in only
+  what's missing and a crash is recoverable. Records with no `title` are
+  treated as not-done, which self-heals junk rows. Pass `--no-resume` to
+  force a full re-scrape.
+
+  **Failures are recorded, never silent.** `fetch_page_async` returns
+  `(html, reason)`; anything that fails all retries is appended to
+  `state['failed']` and written to `data/failed_urls.json`, with a warning
+  logged at the end. Re-running retries them automatically (they aren't in
+  `products.json`, so resume doesn't skip them).
 
 **Frontend** — `frontend/` (React 19, Vite, Tailwind CSS v4, lucide-react icons)
 - Single-file app: `frontend/src/App.jsx` (~800 lines, no router, no state
@@ -157,18 +189,11 @@ computed class name, when adding a new service or status.
 
 ## Known issues / gotchas (found while working in this repo, not yet fixed)
 
-1. **`VENV_PYTHON` path is Unix-only.** In `app.py`:
-   ```python
-   VENV_PYTHON = os.path.join(BASE_DIR, 'venv', 'bin', 'python')
-   ```
-   On Windows a venv puts the interpreter at `venv\Scripts\python.exe`, not
-   `venv/bin/python`. This means **the in-dashboard "Start" scrape button
-   will fail to launch `main.py` on this Windows machine** even though the
-   Flask server itself runs fine (it was launched directly via
-   `venv/Scripts/python.exe app.py`, sidestepping this path). Triggering a
-   scrape from the UI needs this fixed to work locally on Windows —
-   e.g. `sys.executable` or an OS-conditional path. Not fixed as part of the
-   status-page work since it's an unrelated, separately-scoped bug.
+1. **The periodic flush is O(n²).** `save_results()` rewrites the whole of
+   `products.json` every 10 completions. Over a full 3,353-product run that's
+   ~335 rewrites of a file growing toward ~50MB — several GB of cumulative
+   disk writes. Works fine, just wasteful; fix by appending incrementally or
+   flushing on a time interval if it becomes a problem.
 2. `image.png` in the repo root (added by a recent upstream commit) is just a
    README screenshot, not app data.
 3. `check_fields.py`, `test_brand.py`, `test_client.py`, `test_product.py` at
