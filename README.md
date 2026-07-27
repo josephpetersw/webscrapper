@@ -7,7 +7,7 @@
 A robust, concurrent, and UI-driven web scraping tool designed specifically for XphoneKenya.com. This project handles Cloudflare bot protection, supports high concurrency, and presents a beautiful, responsive dashboard to manage, monitor, and export your scraped data.
 
 ---
-
+![alt text](image.png)
 ## 🛠️ Tech Stack
 
 ### Frontend
@@ -68,7 +68,7 @@ Follow these steps to get the project running on your local machine.
      ```
 4. **Install the required Python dependencies**:
    ```bash
-   pip install flask flask-cors beautifulsoup4 lxml curl_cffi aiofiles markdownify pandas openpyxl
+   pip install flask flask-cors beautifulsoup4 lxml curl_cffi aiofiles markdownify pandas openpyxl gunicorn
    ```
 
 ### 2. Frontend Setup
@@ -93,13 +93,36 @@ Follow these steps to get the project running on your local machine.
 
 This project uses a unified Flask server to serve both the Backend REST APIs and the compiled React Frontend UI.
 
-1. **Ensure your Python virtual environment is active** in the project root directory.
-2. **Start the Flask server**:
-   ```bash
-   python app.py
-   ```
-3. **Access the Dashboard**:
-   Open your browser and navigate to: **[http://127.0.0.1:5000](http://127.0.0.1:5000)**
+### 1. Activate the Virtual Environment
+Before starting the server, you must activate the Python virtual environment in your terminal from the project root directory.
+
+- **On Linux / macOS:**
+  ```bash
+  source venv/bin/activate
+  ```
+- **On Windows (Command Prompt / PowerShell):**
+  ```cmd
+  venv\Scripts\activate
+  ```
+
+### 2. Start the Server
+
+**Option A: Production Server (Recommended - High Speed)**
+This runs the app with 4 concurrent worker processes, ensuring blazing fast UI performance and instantaneous data exports without freezing.
+```bash
+./venv/bin/gunicorn --workers 4 --bind 0.0.0.0:5000 app:app
+```
+*(Note: Gunicorn is natively supported on Linux/macOS. If you are on Windows, use Option B instead).*
+
+**Option B: Development Server (Basic/Standard)**
+If you do not have Gunicorn installed or are running natively on Windows, you can start the standard Python development server:
+```bash
+./venv/bin/python app.py
+```
+
+### 3. Access the Dashboard
+Once the server is running (using either option), open your web browser and navigate to:
+**[http://127.0.0.1:5000](http://127.0.0.1:5000)**
 
 ---
 

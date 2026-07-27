@@ -21,6 +21,46 @@ MAIN_SCRIPT = os.path.join(BASE_DIR, 'main.py')
 # Track running scraper process
 scraper_process = None
 
+# ── Memory Cache ────────────────────────────────────────────
+_CACHE = {
+    'products': None,
+    'products_mtime': 0,
+    'categories': None,
+    'categories_mtime': 0
+}
+
+def load_products_from_cache():
+    products_file = os.path.join(DATA_DIR, 'products.json')
+    if not os.path.exists(products_file):
+        return []
+    
+    try:
+        mtime = os.path.getmtime(products_file)
+        if _CACHE['products'] is None or mtime > _CACHE['products_mtime']:
+            with open(products_file, 'r', encoding='utf-8') as f:
+                _CACHE['products'] = json.load(f)
+            _CACHE['products_mtime'] = mtime
+        return _CACHE['products']
+    except Exception as e:
+        logger.error(f"Error reading products.json: {e}")
+        return []
+
+def load_categories_from_cache():
+    cat_file = os.path.join(DATA_DIR, 'categories.json')
+    if not os.path.exists(cat_file):
+        return []
+        
+    try:
+        mtime = os.path.getmtime(cat_file)
+        if _CACHE['categories'] is None or mtime > _CACHE['categories_mtime']:
+            with open(cat_file, 'r', encoding='utf-8') as f:
+                _CACHE['categories'] = json.load(f)
+            _CACHE['categories_mtime'] = mtime
+        return _CACHE['categories']
+    except Exception as e:
+        logger.error(f"Error reading categories.json: {e}")
+        return []
+
 # ── Static React Build ──────────────────────────────────────
 @app.route('/')
 def index():
@@ -121,14 +161,12 @@ def get_products():
         })
         
     try:
-        with open(products_file, 'r', encoding='utf-8') as f:
-            all_products = json.load(f)
+        all_products = load_products_from_cache()
             
         categories_file = os.path.join(DATA_DIR, 'categories.json')
         all_categories = []
         if os.path.exists(categories_file):
-            with open(categories_file, 'r', encoding='utf-8') as f:
-                all_categories = json.load(f)
+            all_categories = load_categories_from_cache()
                 
         # Filter
         filtered = []
@@ -169,8 +207,7 @@ def get_stats():
         return jsonify({'total_products': 0, 'total_categories': 0, 'total_brands': 0, 'total_images': 0})
         
     try:
-        with open(products_file, 'r', encoding='utf-8') as f:
-            products = json.load(f)
+        products = load_products_from_cache()
         
         unique_categories = set()
         unique_brands = set()
@@ -272,8 +309,7 @@ def export_json():
         return send_from_directory(DATA_DIR, 'products.json', as_attachment=True, download_name='phoneplacekenya_products.json')
         
     try:
-        with open(products_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = load_products_from_cache()
         for item in data:
             if 'short_description' in item:
                 item['short_description'] = clean_html(item['short_description'])
@@ -309,8 +345,7 @@ def export_csv():
     is_clean = request.args.get('clean', 'true').lower() in ('true', '1')
     
     try:
-        with open(products_file, 'r', encoding='utf-8') as f:
-            products = json.load(f)
+        products = load_products_from_cache()
         output = io.StringIO()
         fieldnames = ['title', 'brand', 'price', 'url', 'categories', 'images', 'short_description', 'long_description']
         writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
@@ -359,8 +394,7 @@ def export_excel():
     
     try:
         import pandas as pd
-        with open(products_file, 'r', encoding='utf-8') as f:
-            products = json.load(f)
+        products = load_products_from_cache()
             
         data = []
         for p in products:
@@ -403,8 +437,7 @@ def export_xml():
     is_clean = request.args.get('clean', 'true').lower() in ('true', '1')
     
     try:
-        with open(products_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = load_products_from_cache()
         xml_path = os.path.join(DATA_DIR, 'products.xml')
         with open(xml_path, 'w', encoding='utf-8') as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?>\n<products>\n')
@@ -500,15 +533,10 @@ def export_categories():
 
 @app.route('/api/export/categories_csv', methods=['GET'])
 def export_categories_csv():
-    products_file = os.path.join(DATA_DIR, 'products.json')
-    if not os.path.exists(products_file):
-        return jsonify({'error': 'No data to export'}), 404
     try:
-        with open(products_file, 'r', encoding='utf-8') as f:
-            products = json.load(f)
-            
+        all_products = load_products_from_cache()
         categories = set()
-        for p in products:
+        for p in all_products:
             for cat in p.get('categories', []):
                 if cat: categories.add(cat.strip())
                 
@@ -533,8 +561,7 @@ def export_brands_csv():
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
     try:
-        with open(products_file, 'r', encoding='utf-8') as f:
-            products = json.load(f)
+        products = load_products_from_cache()
             
         brands = set()
         for p in products:
