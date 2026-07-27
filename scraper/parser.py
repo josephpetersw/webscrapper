@@ -41,7 +41,7 @@ class Parser:
             data['categories'] = []
 
         # Extract Brand
-        # PhonePlaceKenya usually has categories like 'Realme Phones' or 'Samsung'
+        # Stores commonly name categories after the brand, e.g. 'Realme Phones'
         brand = "Unknown"
         if data['categories']:
             last_cat = data['categories'][-1]

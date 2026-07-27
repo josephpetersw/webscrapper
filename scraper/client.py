@@ -38,6 +38,24 @@ class ScraperClient:
         logger.error(f"Giving up on {url} after {retries} attempts: {last_reason}")
         return None
 
+    def fetch_response(self, url, retries=1):
+        """Like fetch_page but hands back the whole response.
+
+        Some APIs report their total item count in a header (WooCommerce's
+        Store API sends X-WP-Total), which lets us size a catalogue in one
+        request instead of paging through it.
+        """
+        for attempt in range(1, retries + 1):
+            try:
+                response = self.session.get(url, timeout=20)
+                return response
+            except Exception as e:
+                if attempt >= retries:
+                    logger.debug(f"fetch_response failed for {url}: {e}")
+                    return None
+                time.sleep(DEFAULT_BACKOFF * attempt)
+        return None
+
     def fetch_soup(self, url):
         html = self.fetch_page(url)
         if html:

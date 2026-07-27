@@ -1,10 +1,10 @@
-# XphoneKenyaScraper 🚀
+# E-Commerce Scraper 🚀
 
 ![Status](https://img.shields.io/badge/Status-Active-success)
 ![Python Version](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![React Version](https://img.shields.io/badge/React-18.x-61dafb)
 
-A robust, concurrent, and UI-driven web scraping tool designed specifically for XphoneKenya.com. This project handles Cloudflare bot protection, supports high concurrency, and presents a beautiful, responsive dashboard to manage, monitor, and export your scraped data.
+A robust, concurrent, UI-driven scraper for WordPress/WooCommerce storefronts. Point it at any store URL and it discovers the entire catalogue from the site's sitemaps, handles Cloudflare's browser fingerprint checks, and presents a responsive dashboard to manage, monitor, browse and export the scraped data. Each store is kept in its own folder, so you can scrape as many as you like side by side.
 
 ---
 ![alt text](image.png)
@@ -29,9 +29,12 @@ A robust, concurrent, and UI-driven web scraping tool designed specifically for 
 
 ## ✨ Key Features
 
-- **Smart Bot Evasion**: Bypasses Cloudflare checks seamlessly using `curl_cffi` by mimicking legitimate browser TLS fingerprints.
+- **Works On Any Store**: Give it any URL on a WordPress/WooCommerce site and it finds the whole catalogue via `robots.txt` and the site's sitemaps — no per-site configuration.
+- **Smart Bot Evasion**: Passes Cloudflare's browser fingerprint checks using `curl_cffi` by mimicking legitimate browser TLS fingerprints. (Sites presenting an interactive challenge are not supported.)
 - **High-Speed Concurrent Scraping**: Downloads product pages and images rapidly using asynchronous tasks (with configurable worker limits).
-- **Structured File Storage**: Organizes scraped data automatically into a highly structured local filesystem architecture (`data/structured/Category/Brand/Product/`).
+- **Resumable & Verifiable**: Failed URLs are retried with backoff, recorded to `failed_urls.json`, and re-running skips what's already saved — so an interrupted scrape picks up where it left off.
+- **One Folder Per Store**: Each site lands in `data/<domain>/`, and re-scraping asks whether to update in place or keep the old copy as a timestamped version.
+- **Structured File Storage**: Organizes scraped data into a predictable tree (`data/<domain>/structured/Category/Brand/Product/`).
 - **Markdown Conversion**: Automatically sanitizes and converts HTML product descriptions into clean `.md` files for easy reading and editing.
 - **Beautiful Dashboard UI**: A full-featured React dashboard to monitor live scraping progress, view logs, explore local files, and browse products in a grid or list layout.
 - **Export Flexibility**: Export your data exactly how you need it. Choose between raw HTML or clean text formats for JSON, CSV, XML, Excel (.xlsx).
@@ -51,7 +54,7 @@ Follow these steps to get the project running on your local machine.
 
 1. **Clone the repository** and navigate to the root directory:
    ```bash
-   cd XphoneKenyaScraper
+   cd webscrapper
    ```
 2. **Create a Python virtual environment**:
    ```bash
@@ -128,26 +131,36 @@ Once the server is running (using either option), open your web browser and navi
 
 ## 📖 How to Use
 
-1. **Configure Scraping**: On the dashboard, enter a specific product URL to scrape, or leave it blank to scrape the entire sitemap.
-2. **Set Workers**: Adjust the number of **Concurrent Workers** (e.g., 20 or 50). Higher numbers scrape faster but require a stable internet connection.
-3. **Start**: Click **Start**. The dashboard will transition to the Live Logs view, displaying real-time scraping progress and terminal output.
-4. **Browse**: Once completed, browse the extracted products via the Grid or List view, search by keywords, and filter by category.
-5. **Export**: Use the sidebar buttons to export your structured data. **Tip:** Use the "Clean HTML from exports" toggle to choose whether you want raw HTML tags or clean plain text in your CSV/Excel files!
+1. **Enter a store URL**: Any URL on the store will do — its homepage, a category, or a single product. The whole catalogue is discovered from the site's sitemaps.
+2. **Set Workers**: Adjust the number of **Concurrent Workers**. Higher scrapes faster; 8 is a sensible default that avoids tripping rate limits on Cloudflare-fronted sites.
+3. **Confirm**: Review the target and destination folder in the confirmation dialog, then click **Start Scraping**. If you've scraped that store before, you'll be asked whether to update the existing data or save it as a new version.
+4. **Watch**: The dashboard shows live progress and terminal output in the Live Logs view.
+5. **Browse**: Browse the extracted products in Grid or List view, search by keyword, and filter by category. Use the site selector in the header to switch between scraped stores.
+6. **Inspect files**: The File Explorer previews JSON, Markdown and images inline, or opens the raw file in a new tab.
+7. **Export**: Use the sidebar buttons to export your data as JSON, CSV, Excel, XML or ZIP — each in clean-text or raw-HTML flavours.
+
+If any URLs failed, they're listed in that store's `failed_urls.json`. Just run the scrape again — already-saved products are skipped, so only the gaps are retried.
 
 ---
 
 ## 📁 Data Structure
 
-Extracted data is neatly and permanently stored in the `data/structured/` directory:
+Every store gets its own folder under `data/`, named after its domain. Re-scraping a store can either update that folder in place or create a timestamped version beside it, leaving the original untouched:
 
 ```text
 data/
-└── structured/
-    └── Smartphones/
-        └── Realme_Phones/
-            └── Realme_5/
-                ├── data.json              # Product metadata (price, URL, etc.)
-                ├── description.md         # Full long description converted to Markdown
-                ├── short_description.txt  # Clean plain-text short description
-                └── images/                # High-res downloaded product images (.jpg/.png)
+├── example-store.com/                      # one folder per store
+│   ├── products.json                       # every product scraped from this store
+│   ├── categories.json
+│   ├── failed_urls.json                    # URLs that failed, with reasons
+│   └── structured/
+│       └── Smartphones/
+│           └── Realme_Phones/
+│               └── Realme_5/
+│                   ├── data.json           # Product metadata (price, URL, etc.)
+│                   ├── description.md      # Long description converted to Markdown
+│                   ├── short_description.txt
+│                   └── images/             # Downloaded product images
+├── example-store.com_v2_20260728-014500/   # a re-scrape kept as a separate version
+└── another-store.co.ke/                    # a different store
 ```

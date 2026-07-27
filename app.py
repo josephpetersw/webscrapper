@@ -11,7 +11,9 @@ import time
 import shutil
 import platform
 import threading
+import zipfile
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
 
@@ -34,20 +36,37 @@ APP_START_TIME = time.time()
 
 # ── Target Site Reachability (checked in the background so status
 # requests never block on a live network call) ──────────────────
-TARGET_SITE_URL = 'https://www.phoneplacekenya.com'
 TARGET_SITE_CHECK_INTERVAL = 60  # seconds
 _target_site_lock = threading.Lock()
-_target_site_state = {'status': 'checking', 'detail': 'Awaiting first check...', 'checked_at': None}
+_target_site_state = {'status': 'checking', 'name': 'Target Site',
+                      'detail': 'Awaiting first check...', 'checked_at': None}
+
+def target_site_domain():
+    """Domain of the active site, so the health check follows whatever is being scraped."""
+    name = active_site_name()
+    if not name:
+        return None
+    # Strip any _v2_<timestamp> suffix back to the bare domain.
+    return re.sub(r'_v\d+_\d{8}-\d{6}$', '', name)
 
 def _check_target_site_loop():
     from curl_cffi import requests as curl_requests
     while True:
+        domain = target_site_domain()
+        if not domain:
+            with _target_site_lock:
+                _target_site_state.update({
+                    'status': 'checking', 'name': 'Target Site',
+                    'detail': 'No site scraped yet', 'checked_at': None})
+            time.sleep(TARGET_SITE_CHECK_INTERVAL)
+            continue
         try:
             start = time.time()
             session = curl_requests.Session(impersonate="chrome")
-            resp = session.get(TARGET_SITE_URL, timeout=10)
+            resp = session.get(f'https://{domain}', timeout=10)
             elapsed_ms = round((time.time() - start) * 1000)
             with _target_site_lock:
+                _target_site_state['name'] = domain
                 if resp.status_code == 200:
                     _target_site_state['status'] = 'operational'
                     _target_site_state['detail'] = f'Responded 200 OK in {elapsed_ms}ms'
@@ -57,6 +76,7 @@ def _check_target_site_loop():
                 _target_site_state['checked_at'] = datetime.now(timezone.utc).isoformat()
         except Exception as e:
             with _target_site_lock:
+                _target_site_state['name'] = domain
                 _target_site_state['status'] = 'down'
                 _target_site_state['detail'] = f'Unreachable: {e}'
                 _target_site_state['checked_at'] = datetime.now(timezone.utc).isoformat()
@@ -84,45 +104,77 @@ def format_duration(seconds):
     if not parts: parts.append(f"{s}s")
     return ' '.join(parts)
 
+# ── Scraped Sites ───────────────────────────────────────────
+# Each store scraped lives in its own folder under data/, named after its
+# domain (plus _v2_<timestamp> etc. for re-scrapes kept side by side). The
+# dashboard shows one at a time: the "active" site.
+ACTIVE_SITE_FILE = os.path.join(DATA_DIR, '.active_site')
+
+def list_site_dirs():
+    if not os.path.isdir(DATA_DIR):
+        return []
+    names = [d for d in os.listdir(DATA_DIR)
+             if not d.startswith('.') and os.path.isdir(os.path.join(DATA_DIR, d))]
+    return sorted(names, key=lambda n: os.path.getmtime(os.path.join(DATA_DIR, n)), reverse=True)
+
+def active_site_name():
+    """Which site the dashboard is currently showing."""
+    try:
+        with open(ACTIVE_SITE_FILE, 'r', encoding='utf-8') as f:
+            name = f.read().strip()
+        if name and os.path.isdir(os.path.join(DATA_DIR, name)):
+            return name
+    except Exception:
+        pass
+    sites = list_site_dirs()
+    return sites[0] if sites else None
+
+def active_site_dir():
+    name = active_site_name()
+    return os.path.join(DATA_DIR, name) if name else None
+
+def site_file(filename):
+    """Path to a file inside the active site's folder.
+
+    Returns '' when nothing has been scraped yet, which os.path.exists()
+    reports as missing - so callers can treat it like any absent file.
+    """
+    site_dir = active_site_dir()
+    return os.path.join(site_dir, filename) if site_dir else ''
+
+def export_prefix():
+    return (active_site_name() or 'scraped').replace('.', '_')
+
+# Generated export artifacts live out of the way so data/ shows only site folders.
+EXPORT_DIR = os.path.join(DATA_DIR, '.exports')
+
+def export_workspace():
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    return EXPORT_DIR
+
 # ── Memory Cache ────────────────────────────────────────────
-_CACHE = {
-    'products': None,
-    'products_mtime': 0,
-    'categories': None,
-    'categories_mtime': 0
-}
+# Keyed by path so switching between sites doesn't serve stale data.
+_CACHE = {}
+
+def load_json_cached(path, default):
+    if not path or not os.path.exists(path):
+        return default
+    try:
+        mtime = os.path.getmtime(path)
+        entry = _CACHE.get(path)
+        if entry is None or mtime > entry['mtime']:
+            with open(path, 'r', encoding='utf-8') as f:
+                _CACHE[path] = {'data': json.load(f), 'mtime': mtime}
+        return _CACHE[path]['data']
+    except Exception as e:
+        logger.error(f"Error reading {path}: {e}")
+        return default
 
 def load_products_from_cache():
-    products_file = os.path.join(DATA_DIR, 'products.json')
-    if not os.path.exists(products_file):
-        return []
-    
-    try:
-        mtime = os.path.getmtime(products_file)
-        if _CACHE['products'] is None or mtime > _CACHE['products_mtime']:
-            with open(products_file, 'r', encoding='utf-8') as f:
-                _CACHE['products'] = json.load(f)
-            _CACHE['products_mtime'] = mtime
-        return _CACHE['products']
-    except Exception as e:
-        logger.error(f"Error reading products.json: {e}")
-        return []
+    return load_json_cached(site_file('products.json'), [])
 
 def load_categories_from_cache():
-    cat_file = os.path.join(DATA_DIR, 'categories.json')
-    if not os.path.exists(cat_file):
-        return []
-        
-    try:
-        mtime = os.path.getmtime(cat_file)
-        if _CACHE['categories'] is None or mtime > _CACHE['categories_mtime']:
-            with open(cat_file, 'r', encoding='utf-8') as f:
-                _CACHE['categories'] = json.load(f)
-            _CACHE['categories_mtime'] = mtime
-        return _CACHE['categories']
-    except Exception as e:
-        logger.error(f"Error reading categories.json: {e}")
-        return []
+    return load_json_cached(site_file('categories.json'), [])
 
 # ── Static React Build ──────────────────────────────────────
 @app.route('/')
@@ -140,13 +192,18 @@ def trigger_scrape():
     url = req_data.get('url')
     limit = req_data.get('limit')
     workers = req_data.get('workers', 8)
+    new_version = bool(req_data.get('new_version'))
 
-    cmd = [VENV_PYTHON, MAIN_SCRIPT]
-    if url:
-        cmd.extend(['--target_url', url])
+    if not url:
+        return jsonify({'status': 'error',
+                        'message': 'A store URL is required.'}), 400
+
+    cmd = [VENV_PYTHON, MAIN_SCRIPT, '--target_url', url]
     if limit:
         cmd.extend(['--limit', str(limit)])
-    
+    if new_version:
+        cmd.append('--new-version')
+
     cmd.extend(['--workers', str(workers)])
 
     try:
@@ -155,16 +212,36 @@ def trigger_scrape():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+def append_to_scraper_log(message):
+    """Write a line into scraper.log in the scraper's own format.
+
+    The scraper subprocess owns that file, so events that happen here in the
+    web layer (a manual stop, most importantly) would otherwise leave no trace
+    and be indistinguishable from a crash when reading the log later.
+    """
+    try:
+        stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"{stamp} - INFO - {message}\n")
+    except Exception as e:
+        logger.error(f"Could not append to scraper log: {e}")
+
 @app.route('/api/scrape/stop', methods=['POST'])
 def stop_scrape():
     global scraper_process
     if scraper_process and scraper_process.poll() is None:
+        progress = load_json_cached(os.path.join(DATA_DIR, 'progress.json'), {})
+        done, total = progress.get('current', 0), progress.get('total', 0)
         try:
             scraper_process.terminate()
             scraper_process.wait(timeout=5)
-        except:
+        except Exception:
             scraper_process.kill()
         scraper_process = None
+        append_to_scraper_log(
+            f"STOPPED BY USER at {done}/{total} products. Partial data was saved; "
+            f"re-run the same site to resume from here.")
+        logger.info(f"Scrape stopped by user at {done}/{total}")
         return jsonify({'status': 'success', 'message': 'Scraper stopped'})
     return jsonify({'status': 'error', 'message': 'No scraper running'}), 400
 
@@ -173,6 +250,119 @@ def get_status():
     global scraper_process
     running = scraper_process is not None and scraper_process.poll() is None
     return jsonify({'running': running, 'pid': scraper_process.pid if running else None})
+
+# ── Scraped Sites ────────────────────────────────────────────
+def site_summary(name):
+    site_dir = os.path.join(DATA_DIR, name)
+    products_file = os.path.join(site_dir, 'products.json')
+    failed_file = os.path.join(site_dir, 'failed_urls.json')
+    return {
+        'name': name,
+        'products': len(load_json_cached(products_file, [])),
+        'failed': len(load_json_cached(failed_file, [])),
+        'modified': datetime.fromtimestamp(os.path.getmtime(site_dir), timezone.utc).isoformat(),
+        'active': name == active_site_name(),
+    }
+
+@app.route('/api/sites', methods=['GET'])
+def get_sites():
+    return jsonify({'active': active_site_name(),
+                    'sites': [site_summary(n) for n in list_site_dirs()]})
+
+@app.route('/api/sites/active', methods=['POST'])
+def set_active_site_route():
+    name = (request.json or {}).get('name')
+    if not name or not os.path.isdir(os.path.join(DATA_DIR, name)):
+        return jsonify({'status': 'error', 'message': 'Unknown site'}), 404
+    with open(ACTIVE_SITE_FILE, 'w', encoding='utf-8') as f:
+        f.write(name)
+    return jsonify({'status': 'success', 'active': name})
+
+@app.route('/api/site/check', methods=['GET'])
+def check_site():
+    """Does this store already have scraped data? Drives the update-vs-new-version prompt."""
+    url = request.args.get('url', '').strip()
+    if not url:
+        return jsonify({'valid': False, 'message': 'A store URL is required.'})
+
+    parsed = urlparse(url if '://' in url else f'https://{url}')
+    host = (parsed.netloc or parsed.path).lower().split('/')[0].split('@')[-1]
+    if host.startswith('www.'):
+        host = host[4:]
+    if '.' not in host:
+        return jsonify({'valid': False, 'message': 'That does not look like a valid URL.'})
+    name = re.sub(r'[^a-z0-9.\-]', '_', host)
+
+    exists = os.path.isdir(os.path.join(DATA_DIR, name))
+    versions = [d for d in list_site_dirs() if d.startswith(f'{name}_v')]
+    return jsonify({
+        'valid': True,
+        'site': name,
+        'exists': exists,
+        'products': len(load_json_cached(os.path.join(DATA_DIR, name, 'products.json'), [])) if exists else 0,
+        'versions': len(versions),
+    })
+
+@app.route('/api/site/analyze', methods=['GET'])
+def analyze_site_route():
+    """Reconnaissance on a store before scraping: platform, theme, plugins, sitemaps, APIs."""
+    url = request.args.get('url', '').strip()
+    if not url:
+        return jsonify({'valid': False, 'message': 'A store URL is required.'}), 400
+
+    parsed = urlparse(url if '://' in url else f'https://{url}')
+    host = (parsed.netloc or parsed.path).lower().split('/')[0]
+    if '.' not in host:
+        return jsonify({'valid': False, 'message': 'That does not look like a valid URL.'}), 400
+
+    try:
+        from scraper.client import ScraperClient
+        from scraper.parser import Parser
+        from scraper import discovery
+        report = discovery.analyze_site(ScraperClient(), Parser(), url)
+        report['valid'] = True
+        return jsonify(report)
+    except Exception as e:
+        logger.error(f"Site analysis failed for {url}: {e}")
+        # Analysis is advisory - never let it block the user from scraping.
+        return jsonify({'valid': True, 'reachable': False, 'url': url,
+                        'platform': {'id': 'unknown', 'name': 'Unknown', 'supported': False,
+                                     'confidence': 'none', 'evidence': []},
+                        'warnings': [f'Could not analyze this site: {e}'],
+                        'notes': [], 'sitemaps': [], 'product_sitemaps': [], 'apis': []})
+
+# ── Wipe ─────────────────────────────────────────────────────
+@app.route('/api/system/wipe', methods=['POST'])
+def wipe_everything():
+    """Delete all scraped data, caches and logs. Irreversible."""
+    global scraper_process
+    if scraper_process and scraper_process.poll() is None:
+        return jsonify({'status': 'error',
+                        'message': 'A scrape is running. Stop it before wiping.'}), 409
+
+    removed = []
+    try:
+        if os.path.isdir(DATA_DIR):
+            for entry in os.listdir(DATA_DIR):
+                path = os.path.join(DATA_DIR, entry)
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                removed.append(entry)
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        _CACHE.clear()
+
+        if os.path.exists(LOG_FILE):
+            open(LOG_FILE, 'w', encoding='utf-8').close()
+            removed.append('scraper.log')
+
+        logger.info(f"Wiped {len(removed)} item(s) from data directory")
+        return jsonify({'status': 'success', 'removed': removed})
+    except Exception as e:
+        logger.error(f"Wipe failed: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ── System Status (health of every moving part in this app) ───
 @app.route('/api/system/status', methods=['GET'])
@@ -242,7 +432,8 @@ def system_status():
     # 6. Target site (external dependency, checked in the background)
     with _target_site_lock:
         ts = dict(_target_site_state)
-    services.append({'id': 'target_site', 'name': 'XphoneKenya.com', 'category': 'External', 'icon': 'globe',
+    services.append({'id': 'target_site', 'name': ts.get('name') or 'Target Site',
+                      'category': 'External', 'icon': 'globe',
                       'status': ts['status'], 'detail': ts['detail'], 'checked_at': ts['checked_at']})
 
     # 7. Disk space
@@ -307,7 +498,7 @@ def get_products():
     search = request.args.get('search', '').lower()
     category = request.args.get('category', '')
     
-    products_file = os.path.join(DATA_DIR, 'products.json')
+    products_file = site_file('products.json')
     if not os.path.exists(products_file):
         return jsonify({
             'data': [],
@@ -322,7 +513,7 @@ def get_products():
     try:
         all_products = load_products_from_cache()
             
-        categories_file = os.path.join(DATA_DIR, 'categories.json')
+        categories_file = site_file('categories.json')
         all_categories = []
         if os.path.exists(categories_file):
             all_categories = load_categories_from_cache()
@@ -361,7 +552,7 @@ def get_products():
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    products_file = os.path.join(DATA_DIR, 'products.json')
+    products_file = site_file('products.json')
     if not os.path.exists(products_file):
         return jsonify({'total_products': 0, 'total_categories': 0, 'total_brands': 0, 'total_images': 0})
         
@@ -403,6 +594,8 @@ def list_files():
         except:
             return tree
         for item in items:
+            if item.startswith('.'):
+                continue  # internal state (.active_site) and export scratch space
             item_path = os.path.join(path, item)
             rel_path = os.path.relpath(item_path, DATA_DIR)
             is_dir = os.path.isdir(item_path)
@@ -434,13 +627,13 @@ def get_image():
     safe_name = re.sub(r'[^a-zA-Z0-9]', '_', title)
     safe_name = re.sub(r'_+', '_', safe_name).strip('_')
     
-    # 1. Check old flat path
-    old_path = os.path.join(DATA_DIR, 'images', safe_name, filename)
-    if os.path.exists(old_path):
+    # 1. Check flat path within the active site
+    old_path = os.path.join(site_file('images'), safe_name, filename) if site_file('images') else ''
+    if old_path and os.path.exists(old_path):
         return send_from_directory(os.path.dirname(old_path), filename)
-        
+
     # 2. Check structured path by scanning
-    structured_dir = os.path.join(DATA_DIR, 'structured')
+    structured_dir = site_file('structured')
     if os.path.exists(structured_dir):
         for root, dirs, files in os.walk(structured_dir):
             if os.path.basename(root) == safe_name:
@@ -458,14 +651,14 @@ def serve_data(filename):
 # ── Export ────────────────────────────────────────────────────
 @app.route('/api/export/json', methods=['GET'])
 def export_json():
-    products_file = os.path.join(DATA_DIR, 'products.json')
+    products_file = site_file('products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
         
     is_clean = request.args.get('clean', 'true').lower() in ('true', '1')
     
     if not is_clean:
-        return send_from_directory(DATA_DIR, 'products.json', as_attachment=True, download_name='phoneplacekenya_products.json')
+        return send_from_directory(active_site_dir(), 'products.json', as_attachment=True, download_name=f'{export_prefix()}_products.json')
         
     try:
         data = load_products_from_cache()
@@ -481,7 +674,7 @@ def export_json():
         return Response(
             output.getvalue(),
             mimetype='application/json',
-            headers={'Content-Disposition': 'attachment; filename=phoneplacekenya_products.json'}
+            headers={'Content-Disposition': f'attachment; filename={export_prefix()}_products.json'}
         )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -497,7 +690,7 @@ def clean_html(raw_html):
 
 @app.route('/api/export/csv', methods=['GET'])
 def export_csv():
-    products_file = os.path.join(DATA_DIR, 'products.json')
+    products_file = site_file('products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
         
@@ -538,14 +731,14 @@ def export_csv():
         return Response(
             output.getvalue(),
             mimetype='text/csv',
-            headers={'Content-Disposition': 'attachment; filename=phoneplacekenya_products.csv'}
+            headers={'Content-Disposition': f'attachment; filename={export_prefix()}_products.csv'}
         )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export/excel', methods=['GET'])
 def export_excel():
-    products_file = os.path.join(DATA_DIR, 'products.json')
+    products_file = site_file('products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
         
@@ -581,15 +774,15 @@ def export_excel():
             })
             
         df = pd.DataFrame(data)
-        excel_path = os.path.join(DATA_DIR, 'products.xlsx')
+        excel_path = os.path.join(export_workspace(), 'products.xlsx')
         df.to_excel(excel_path, index=False)
-        return send_from_directory(DATA_DIR, 'products.xlsx', as_attachment=True, download_name='phoneplacekenya_products.xlsx')
+        return send_from_directory(export_workspace(), 'products.xlsx', as_attachment=True, download_name=f'{export_prefix()}_products.xlsx')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export/xml', methods=['GET'])
 def export_xml():
-    products_file = os.path.join(DATA_DIR, 'products.json')
+    products_file = site_file('products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
         
@@ -597,7 +790,7 @@ def export_xml():
     
     try:
         data = load_products_from_cache()
-        xml_path = os.path.join(DATA_DIR, 'products.xml')
+        xml_path = os.path.join(export_workspace(), 'products.xml')
         with open(xml_path, 'w', encoding='utf-8') as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?>\n<products>\n')
             for item in data:
@@ -618,7 +811,7 @@ def export_xml():
                     f.write(f'    <{k}>{v}</{k}>\n')
                 f.write('  </product>\n')
             f.write('</products>')
-        return send_from_directory(DATA_DIR, 'products.xml', as_attachment=True, download_name='phoneplacekenya_products.xml')
+        return send_from_directory(export_workspace(), 'products.xml', as_attachment=True, download_name=f'{export_prefix()}_products.xml')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -629,27 +822,27 @@ def export_images_all():
 
 @app.route('/api/export/structured', methods=['GET'])
 def export_structured():
-    images_dir = os.path.join(DATA_DIR, 'structured')
+    images_dir = site_file('structured')
     if not os.path.exists(images_dir):
-        images_dir = os.path.join(DATA_DIR, 'images')
+        images_dir = site_file('images')
     if not os.path.exists(images_dir):
         return jsonify({'error': 'No data to export'}), 404
     try:
         import shutil
-        zip_path = os.path.join(DATA_DIR, 'structured_export')
+        zip_path = os.path.join(export_workspace(), 'structured_export')
         shutil.make_archive(zip_path, 'zip', images_dir)
-        return send_from_directory(DATA_DIR, 'structured_export.zip', as_attachment=True, download_name='phoneplacekenya_structured.zip')
+        return send_from_directory(export_workspace(), 'structured_export.zip', as_attachment=True, download_name=f'{export_prefix()}_structured.zip')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export/structured/data', methods=['GET'])
 def export_structured_data():
-    structured_dir = os.path.join(DATA_DIR, 'structured')
+    structured_dir = site_file('structured')
     if not os.path.exists(structured_dir):
         return jsonify({'error': 'No structured data to export'}), 404
     try:
         import zipfile
-        zip_path = os.path.join(DATA_DIR, 'structured_data.zip')
+        zip_path = os.path.join(export_workspace(), 'structured_data.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(structured_dir):
                 # Exclude images directories
@@ -659,18 +852,18 @@ def export_structured_data():
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, structured_dir)
                     zipf.write(file_path, arcname)
-        return send_from_directory(DATA_DIR, 'structured_data.zip', as_attachment=True, download_name='phoneplacekenya_data_only.zip')
+        return send_from_directory(export_workspace(), 'structured_data.zip', as_attachment=True, download_name=f'{export_prefix()}_data_only.zip')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export/structured/images', methods=['GET'])
 def export_structured_images():
-    structured_dir = os.path.join(DATA_DIR, 'structured')
+    structured_dir = site_file('structured')
     if not os.path.exists(structured_dir):
         return jsonify({'error': 'No structured data to export'}), 404
     try:
         import zipfile
-        zip_path = os.path.join(DATA_DIR, 'structured_images.zip')
+        zip_path = os.path.join(export_workspace(), 'structured_images.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(structured_dir):
                 if os.path.basename(root) == 'images':
@@ -679,16 +872,197 @@ def export_structured_images():
                         # Keep the product folder name before /images
                         arcname = os.path.join(os.path.basename(os.path.dirname(root)), file)
                         zipf.write(file_path, arcname)
-        return send_from_directory(DATA_DIR, 'structured_images.zip', as_attachment=True, download_name='phoneplacekenya_images_only.zip')
+        return send_from_directory(export_workspace(), 'structured_images.zip', as_attachment=True, download_name=f'{export_prefix()}_images_only.zip')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ── Composable exports ────────────────────────────────────────
+# The builders below take a product list rather than reading the active site,
+# so one request can export any combination of sites and formats.
+
+PRODUCT_FIELDS = ['title', 'brand', 'price', 'url', 'categories', 'images',
+                  'short_description', 'long_description']
+
+def _descriptions(product, clean):
+    short = product.get('short_description', '') or ''
+    long_ = product.get('long_description', '') or ''
+    if clean:
+        return clean_html(short), clean_html(long_)
+    return short.replace('<br>', '\n'), long_.replace('<br>', '\n')
+
+def _rows(products, clean):
+    for p in products:
+        if not p.get('title'):
+            continue
+        short, long_ = _descriptions(p, clean)
+        yield {
+            'title': p.get('title', ''), 'brand': p.get('brand', ''),
+            'price': p.get('price', ''), 'url': p.get('url', ''),
+            'categories': ' > '.join(p.get('categories', [])),
+            'images': ' | '.join(p.get('images', [])),
+            'short_description': short, 'long_description': long_,
+        }
+
+def build_json(products, clean):
+    data = []
+    for p in products:
+        item = dict(p)
+        item['short_description'], item['long_description'] = _descriptions(p, clean)
+        data.append(item)
+    return json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
+
+def build_csv(products, clean):
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=PRODUCT_FIELDS, extrasaction='ignore')
+    writer.writeheader()
+    for row in _rows(products, clean):
+        writer.writerow(row)
+    return out.getvalue().encode('utf-8-sig')
+
+def build_excel(products, clean):
+    import pandas as pd
+    strip_ctrl = lambda s: re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', str(s))
+    frame = pd.DataFrame([{k.replace('_', ' ').title(): strip_ctrl(v) for k, v in row.items()}
+                          for row in _rows(products, clean)])
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        frame.to_excel(writer, index=False, sheet_name='Products')
+    return buffer.getvalue()
+
+def build_xml(products, clean):
+    esc = lambda v: str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>\n<products>\n']
+    for p in products:
+        if not p.get('title'):
+            continue
+        item = dict(p)
+        item['short_description'], item['long_description'] = _descriptions(p, clean)
+        parts.append('  <product>\n')
+        for key, value in item.items():
+            value = ', '.join(esc(v) for v in value) if isinstance(value, list) else esc(value)
+            parts.append(f'    <{key}>{value}</{key}>\n')
+        parts.append('  </product>\n')
+    parts.append('</products>')
+    return ''.join(parts).encode('utf-8')
+
+def build_list_csv(products, key, header):
+    values = set()
+    for p in products:
+        field = p.get(key)
+        for item in (field if isinstance(field, list) else [field]):
+            if item and str(item).strip() and str(item) != 'Unknown':
+                values.add(str(item).strip())
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([header])
+    for value in sorted(values):
+        writer.writerow([value])
+    return out.getvalue().encode('utf-8-sig')
+
+EXPORT_BUILDERS = {
+    'json':       ('products.json', lambda p, c: build_json(p, c)),
+    'csv':        ('products.csv',  lambda p, c: build_csv(p, c)),
+    'excel':      ('products.xlsx', lambda p, c: build_excel(p, c)),
+    'xml':        ('products.xml',  lambda p, c: build_xml(p, c)),
+    'categories': ('categories.csv', lambda p, c: build_list_csv(p, 'categories', 'Category Name')),
+    'brands':     ('brands.csv',     lambda p, c: build_list_csv(p, 'brand', 'Brand Name')),
+}
+
+# Archive formats copy files off disk rather than serialising products.
+ARCHIVE_FORMATS = {
+    'archive_all': ('everything', lambda name: True),
+    'archive_data': ('data-only', lambda name: name != 'images'),
+    'archive_images': ('images-only', lambda name: name == 'images'),
+}
+
+def add_structured_to_zip(zipf, site, fmt, prefix):
+    structured = os.path.join(DATA_DIR, site, 'structured')
+    if not os.path.isdir(structured):
+        return 0
+    written = 0
+    for root, dirs, files in os.walk(structured):
+        in_images = os.path.basename(root) == 'images'
+        if fmt == 'archive_data' and in_images:
+            dirs[:] = []
+            continue
+        if fmt == 'archive_images' and not in_images:
+            continue
+        for filename in files:
+            full = os.path.join(root, filename)
+            arc = os.path.join(prefix, os.path.relpath(full, structured))
+            try:
+                zipf.write(full, arc)
+                written += 1
+            except Exception as e:
+                logger.error(f"Skipping {full} in archive: {e}")
+    return written
+
+@app.route('/api/export/bundle', methods=['POST'])
+def export_bundle():
+    """Export any combination of sites and formats.
+
+    One site and one file format downloads that file directly; anything more
+    is bundled into a ZIP with a folder per site.
+    """
+    body = request.json or {}
+    sites = [s for s in (body.get('sites') or []) if os.path.isdir(os.path.join(DATA_DIR, s))]
+    formats = [f for f in (body.get('formats') or [])
+               if f in EXPORT_BUILDERS or f in ARCHIVE_FORMATS]
+    clean = bool(body.get('clean', True))
+
+    if not sites:
+        return jsonify({'error': 'Select at least one site to export.'}), 400
+    if not formats:
+        return jsonify({'error': 'Select at least one export format.'}), 400
+
+    suffix = '' if clean else '_raw'
+
+    # Fast path: a single plain file, downloaded as-is.
+    if len(sites) == 1 and len(formats) == 1 and formats[0] in EXPORT_BUILDERS:
+        site, fmt = sites[0], formats[0]
+        filename, builder = EXPORT_BUILDERS[fmt]
+        try:
+            payload = builder(load_json_cached(os.path.join(DATA_DIR, site, 'products.json'), []), clean)
+        except Exception as e:
+            logger.error(f"Export {fmt} for {site} failed: {e}")
+            return jsonify({'error': str(e)}), 500
+        download = f"{site.replace('.', '_')}{suffix}_{filename}"
+        return Response(payload, mimetype='application/octet-stream',
+                        headers={'Content-Disposition': f'attachment; filename={download}'})
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for site in sites:
+            products = load_json_cached(os.path.join(DATA_DIR, site, 'products.json'), [])
+            folder = site if len(sites) > 1 else ''
+            for fmt in formats:
+                try:
+                    if fmt in EXPORT_BUILDERS:
+                        filename, builder = EXPORT_BUILDERS[fmt]
+                        zipf.writestr(os.path.join(folder, f"{suffix.lstrip('_') or 'clean'}_{filename}"
+                                                   if suffix else filename),
+                                      builder(products, clean))
+                    else:
+                        label = ARCHIVE_FORMATS[fmt][0]
+                        add_structured_to_zip(zipf, site, fmt, os.path.join(folder, label))
+                except Exception as e:
+                    # One bad format shouldn't lose the rest of the bundle.
+                    logger.error(f"Export {fmt} for {site} failed: {e}")
+                    zipf.writestr(os.path.join(folder, f'{fmt}_FAILED.txt'), str(e))
+
+    buffer.seek(0)
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    name = f"export_{sites[0].replace('.', '_')}_{stamp}.zip" if len(sites) == 1 \
+        else f"export_{len(sites)}_sites_{stamp}.zip"
+    return Response(buffer.getvalue(), mimetype='application/zip',
+                    headers={'Content-Disposition': f'attachment; filename={name}'})
+
 @app.route('/api/export/categories', methods=['GET'])
 def export_categories():
-    cat_file = os.path.join(DATA_DIR, 'categories.json')
+    cat_file = site_file('categories.json')
     if not os.path.exists(cat_file):
         return jsonify({'error': 'No categories to export'}), 404
-    return send_from_directory(DATA_DIR, 'categories.json', as_attachment=True, download_name='categories.json')
+    return send_from_directory(active_site_dir(), 'categories.json', as_attachment=True, download_name='categories.json')
 
 @app.route('/api/export/categories_csv', methods=['GET'])
 def export_categories_csv():
@@ -709,14 +1083,14 @@ def export_categories_csv():
         return Response(
             output.getvalue(),
             mimetype='text/csv',
-            headers={'Content-Disposition': 'attachment; filename=phoneplacekenya_categories.csv'}
+            headers={'Content-Disposition': f'attachment; filename={export_prefix()}_categories.csv'}
         )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export/brands_csv', methods=['GET'])
 def export_brands_csv():
-    products_file = os.path.join(DATA_DIR, 'products.json')
+    products_file = site_file('products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
     try:
@@ -737,7 +1111,7 @@ def export_brands_csv():
         return Response(
             output.getvalue(),
             mimetype='text/csv',
-            headers={'Content-Disposition': 'attachment; filename=phoneplacekenya_brands.csv'}
+            headers={'Content-Disposition': f'attachment; filename={export_prefix()}_brands.csv'}
         )
     except Exception as e:
         return jsonify({'error': str(e)}), 500

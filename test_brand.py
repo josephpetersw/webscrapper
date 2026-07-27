@@ -3,9 +3,9 @@ from bs4 import BeautifulSoup
 import json
 
 urls = [
-    'https://www.phoneplacekenya.com/product/realme-5/',
-    'https://www.phoneplacekenya.com/product/samsung-galaxy-s23-ultra/',
-    'https://www.phoneplacekenya.com/product/apple-iphone-14-pro-max/'
+    'https://example-store.com/product/realme-5/',
+    'https://example-store.com/product/samsung-galaxy-s23-ultra/',
+    'https://example-store.com/product/apple-iphone-14-pro-max/'
 ]
 
 client = ScraperClient()

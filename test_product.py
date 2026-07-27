@@ -4,7 +4,7 @@ import json
 if __name__ == '__main__':
     client = ScraperClient()
     print("Fetching sample product...")
-    soup = client.fetch_soup('https://www.phoneplacekenya.com/product/samsung-galaxy-s24-ultra/')
+    soup = client.fetch_soup('https://example-store.com/product/samsung-galaxy-s24-ultra/')
     if soup:
         data = {}
         title_elem = soup.find('h1', class_='product_title')

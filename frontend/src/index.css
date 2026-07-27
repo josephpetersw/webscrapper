@@ -59,6 +59,9 @@
   .btn-outline-secondary {
     @apply border border-secondary text-secondary hover:bg-secondary hover:text-white shadow-[0_10px_20px_-10px_rgba(128,93,202,0.44)];
   }
+  .btn-outline-danger {
+    @apply border border-danger text-danger hover:bg-danger hover:text-white shadow-[0_10px_20px_-10px_rgba(231,81,90,0.44)];
+  }
 
   .badge {
     @apply bg-primary/10 text-primary py-0.5 px-2 rounded font-semibold text-xs;

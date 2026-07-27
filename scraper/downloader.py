@@ -1,10 +1,38 @@
 import asyncio
 import os
+import re
 import aiofiles
+from urllib.parse import unquote, urlparse
 from curl_cffi.requests import AsyncSession
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Characters Windows refuses in a filename, plus control codes.
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_NON_PRINTABLE = re.compile(r'[^\x20-\x7e]')
+MAX_FILENAME_LEN = 100
+
+
+def safe_filename(url, fallback='image'):
+    """Turn an image URL into a filename the filesystem will actually accept.
+
+    Source URLs routinely contain percent-encoding, non-ASCII characters and
+    query strings, any of which make open() fail on Windows - which silently
+    cost us the image.
+    """
+    raw = unquote(urlparse(url).path.split('/')[-1])
+    name = _NON_PRINTABLE.sub('_', _ILLEGAL_FILENAME_CHARS.sub('_', raw)).strip('. ')
+    if not name:
+        return fallback
+    if len(name) > MAX_FILENAME_LEN:
+        stem, dot, ext = name.rpartition('.')
+        if dot and len(ext) <= 5:
+            name = stem[:MAX_FILENAME_LEN - len(ext) - 1] + '.' + ext
+        else:
+            name = name[:MAX_FILENAME_LEN]
+    return name
+
 
 class ImageDownloader:
     def __init__(self, base_dir, concurrency=10):
@@ -15,8 +43,8 @@ class ImageDownloader:
 
     async def download_image(self, session, url, save_dir):
         os.makedirs(save_dir, exist_ok=True)
-        
-        file_name = url.split('/')[-1]
+
+        file_name = safe_filename(url)
         file_path = os.path.join(save_dir, file_name)
 
         if os.path.exists(file_path):

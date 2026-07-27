@@ -4,16 +4,21 @@ Guidance for Claude Code (or any future contributor) working in this repository.
 
 ## What this project is
 
-**XphoneKenyaScraper** (repo name: `webscrapper`) is a concurrent web scraper and
-data-management dashboard purpose-built for **phoneplacekenya.com** (a
-Cloudflare-protected WooCommerce storefront). It crawls the site's product
-sitemap, extracts structured product data (title, price, brand, categories,
-images, descriptions), downloads images, and stores everything on disk under
-`data/`. A Flask backend exposes this data and scraper controls over a REST
-API; a React (Vite) single-page app consumes that API as a dashboard.
+`webscrapper` is a **general-purpose e-commerce scraper** and data-management
+dashboard for WordPress/WooCommerce storefronts. Point it at any URL on a store
+and it discovers that store's whole catalogue from its sitemaps, extracts
+structured product data (title, price, brand, categories, images,
+descriptions), downloads images, and writes everything to disk. A Flask backend
+exposes the data and scraper controls over a REST API; a React (Vite)
+single-page app consumes that API as a dashboard.
 
-There is no database — `data/products.json` and `data/categories.json` are
-the source of truth, loaded into memory and cached by the backend.
+It is **not tied to any one store** — nothing about a specific site should be
+hardcoded. Multiple stores can be scraped and kept side by side.
+
+There is no database. Each store owns a folder under `data/<domain>/`, and
+`products.json` / `categories.json` inside it are the source of truth, loaded
+into memory and cached by the backend. The dashboard displays one store at a
+time — the "active" site, recorded in `data/.active_site`.
 
 GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
 
@@ -43,38 +48,64 @@ GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
   dict (title, short/long description, categories via breadcrumbs, brand
   inferred from the last breadcrumb category or first word of the title,
   images from the gallery wrapper, price). **This is the single most
-  fragile part of the project** — it depends entirely on phoneplacekenya.com's
-  current WooCommerce theme markup. If scrapes start coming back empty, this
-  is the first place to check (the site's theme may have changed).
+  fragile part of the project** — it keys off standard WooCommerce class names
+  (`product_title`, `woocommerce-product-details__short-description`,
+  `tab-description`, `.woocommerce-product-gallery__wrapper`), so it works
+  across most WooCommerce stores but breaks on heavily customised themes. If a
+  scrape returns products with empty titles, this is the first place to look.
 - `scraper/downloader.py` — `ImageDownloader`: async image downloads with a
   semaphore for concurrency control, skips files that already exist on disk
   (resumable).
 - `main.py` — orchestrates: discover product URLs → scrape concurrently with
   `asyncio` + a `Semaphore(workers)` → write
-  `data/structured/<category>/<product>/` with `data.json`, `description.md`,
-  `short_description.txt`, `images/`. Flushes `products.json` /
-  `categories.json` / `failed_urls.json` every 10 completions plus a final
-  write. Progress goes to `data/progress.json` (`{current, total, eta}`),
-  which the frontend polls for the live progress bar. Logs to stdout and
-  `scraper.log`. CLI:
-  `python main.py --target_url URL --limit N --workers 8 [--no-resume] [--single-product]`.
+  `data/<site>/structured/<category>/<product>/` with `data.json`,
+  `description.md`, `short_description.txt`, `images/`. Flushes
+  `products.json` / `categories.json` / `failed_urls.json` every 10
+  completions plus a final write. Progress goes to `data/progress.json`
+  (`{current, total, eta}`), which the frontend polls for the live progress
+  bar. Logs to stdout and `scraper.log`. CLI:
+  `python main.py --target_url URL [--limit N] [--workers 8] [--no-resume] [--single-product] [--new-version]`.
 
-  **Site discovery (`discover_product_urls`)** — works against any
-  WordPress/WooCommerce store, not just the default one. Reads `robots.txt`
-  for `Sitemap:` directives, falls back to the conventional locations
-  (`/sitemap_index.xml`, `/sitemap.xml`, `/wp-sitemap.xml`,
-  `/product-sitemap.xml`), then walks sitemap *indexes* down to leaf
-  sitemaps. If any leaf sitemap is name-identified as a product sitemap, only
-  those are trusted; URL-pattern matching is a fallback for stores whose
-  sitemaps aren't helpfully named. Two traps worth knowing, both already
-  handled and easy to reintroduce:
+  **A run must always reach the end, or be stopped by the user — nothing else.**
+  Several things enforce that, and removing any one of them reintroduces
+  silent partial scrapes:
+    - `scrape_product()` is a thin wrapper that catches everything and records
+      the URL as failed; the real work is in `_scrape_product_inner()`.
+      Product pages are wildly inconsistent and *will* throw.
+    - `asyncio.gather(..., return_exceptions=True)` — without this one
+      unhandled task exception abandons every remaining product.
+    - `write_json_atomic()` (temp file + `os.replace`) — these files are
+      rewritten every few seconds while the dashboard polls them; writing in
+      place lets a reader parse a half-written file.
+    - `safe_path_segment()` and `downloader.safe_filename()` — titles and
+      image URLs go straight into paths. Windows caps paths at 260 chars and
+      rejects a set of characters outright; unsanitised names silently lose
+      images and whole products.
+    - A manual stop is logged to `scraper.log` by `app.py`'s stop endpoint, so
+      a stopped run is distinguishable from a crash after the fact.
+
+- `scraper/discovery.py` — platform fingerprinting and product-URL discovery,
+  shared by the scraper and the dashboard's pre-scrape analysis. Two entry
+  points: `analyze_site()` (fast, ~4 requests, used while a dialog is open)
+  and `discover_products()` (exhaustive, used at scrape time).
+
+  **Discovery is layered and additive**, because no single strategy works
+  everywhere and stores are often inconsistent with themselves:
+  sitemaps → platform API (Shopify `/products.json`, WooCommerce Store API,
+  WP REST) → listing-page crawl as a last resort. Results are **merged, not
+  first-wins** — on the reference store the sitemaps yield 3,353 URLs and the
+  WooCommerce API 3,400, and the union is what gets scraped. If you make this
+  "first strategy that returns something wins", you will silently lose products.
+
+  Traps already handled here, easy to reintroduce:
     - **Never put `'item'` in `PRODUCT_SITEMAP_HINTS`** — the word "sitemap"
-      itself contains "item", so it matches every sitemap on the site.
+      contains "item", so it matches every sitemap on the site.
     - `product_cat-`, `product_tag-`, `pa_*-` sitemaps list category / tag /
-      attribute *archive* pages, not products; `TAXONOMY_SITEMAP_HINTS`
-      excludes them. Likewise `/shop/` and `/store/` are deliberately absent
-      from `PRODUCT_URL_HINTS` (they match catalogue indexes far more often
-      than products).
+      attribute *archive* pages, not products (`TAXONOMY_SITEMAP_HINTS`).
+    - `/shop/` and `/store/` are deliberately absent from `PRODUCT_URL_HINTS`
+      — they match catalogue indexes far more often than products.
+    - WordPress theme/plugin names are parsed from asset URLs with a strict
+      slug charset; a loose pattern picks up `*` and template placeholders.
 
   **Resume** is on by default: `load_existing_products()` reads the previous
   `products.json` and skips URLs already scraped, so a re-run fills in only
@@ -128,6 +159,35 @@ There is no `requirements.txt` — dependencies are only documented in the
 README's `pip install` line. If you add a new Python dependency, update the
 README's install command (there's nowhere else it's tracked).
 
+## Multi-site data layout
+
+```
+data/
+├── .active_site                  # which site the dashboard shows (plain text)
+├── .exports/                     # scratch space for generated xlsx/xml/zip
+├── progress.json                 # live run state, global to whichever scrape is running
+├── example-store.com/            # one folder per store, named after its domain
+│   ├── products.json
+│   ├── categories.json
+│   ├── failed_urls.json
+│   └── structured/<Category>/<Product>/{data.json,description.md,short_description.txt,images/}
+└── example-store.com_v2_20260728-014500/   # re-scrape kept as a separate version
+```
+
+Folder naming lives in `main.py`: `site_folder_name()` lowercases the host and
+strips a leading `www.`, so `https://www.foo.com/x` and `https://foo.com` map
+to the same folder. `resolve_site_dir(url, new_version=True)` allocates
+`<site>_v2_<timestamp>`, `_v3_`, … instead of touching the existing folder.
+
+On the backend everything reads through `active_site_dir()` /
+`site_file(name)` — **never** `os.path.join(DATA_DIR, 'products.json')`
+directly, or you'll break multi-site. `site_file()` returns `''` (not `None`)
+when nothing has been scraped, so `os.path.exists()` treats it as missing.
+`_CACHE` is keyed by full path so switching sites can't serve stale data.
+
+Dotfiles are filtered out of `/api/files`, keeping `.active_site` and
+`.exports/` out of the File Explorer.
+
 ## API surface (all under `app.py`)
 
 | Route | Method | Purpose |
@@ -136,7 +196,13 @@ README's install command (there's nowhere else it's tracked).
 | `/api/scrape` | POST | Launches `main.py` as a subprocess (`{url, limit, workers}`) |
 | `/api/scrape/stop` | POST | Terminates the running scraper subprocess |
 | `/api/status` | GET | `{running, pid}` — is a scrape currently active |
-| `/api/system/status` | GET | **New.** Full health report, see below |
+| `/api/system/status` | GET | Full health report, see below |
+| `/api/system/wipe` | POST | Deletes every site folder, cache and the log. Refuses (409) while a scrape is running |
+| `/api/sites` | GET | All scraped sites with product/failure counts and which is active |
+| `/api/sites/active` | POST | Switch which site the dashboard shows |
+| `/api/site/check` | GET | `?url=` → whether that store already has data; drives the update-vs-new-version prompt |
+| `/api/site/analyze` | GET | `?url=` → platform, theme, plugins, sitemaps, APIs, estimated product count. Advisory only — never blocks a scrape |
+| `/api/export/bundle` | POST | `{sites[], formats[], clean}` → one file if a single site+format, otherwise a ZIP with a folder per site |
 | `/api/logs` | GET | Tail of `scraper.log` (`?lines=N`) |
 | `/api/progress` | GET | Contents of `data/progress.json` |
 | `/api/products` | GET | Paginated/filterable product list (`page`, `limit`, `search`, `category`) |
@@ -165,12 +231,13 @@ that reports the health of every moving part of the app:
 - **Data Storage** — checks `data/` exists and is writable, reports indexed product count.
 - **Frontend Build** — checks `frontend/dist/index.html` exists, reports its build timestamp.
 - **Logging** — checks `scraper.log` exists, reports size and time since last write.
-- **XphoneKenya.com (target site)** — a genuine outbound reachability check
-  against `https://www.phoneplacekenya.com`, run on a **daemon background
-  thread** on a 60-second interval (`_check_target_site_loop` in `app.py`),
-  cached in a lock-guarded module dict. Deliberately **not** done inline in
-  the request handler — a live network call in a single-threaded Flask dev
-  server would stall every other request while it waited on the network.
+- **Target site** — a genuine outbound reachability check against *the active
+  site's* domain (`target_site_domain()` strips any `_v2_<timestamp>` suffix);
+  reports "No site scraped yet" when `data/` is empty. Runs on a **daemon
+  background thread** on a 60-second interval (`_check_target_site_loop` in
+  `app.py`), cached in a lock-guarded module dict. Deliberately **not** done
+  inline in the request handler — a live network call in a single-threaded
+  Flask dev server would stall every other request while it waited.
 - **Disk Space** — `shutil.disk_usage()` on the app's drive; "warning" below
   10% free, "down" below 3% free.
 - **Python Runtime** — version and OS, always "operational".

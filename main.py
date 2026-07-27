@@ -5,11 +5,13 @@ import os
 import re
 import time
 import argparse
+from datetime import datetime
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from scraper.client import ScraperClient
 from scraper.parser import Parser
 from scraper.downloader import ImageDownloader
+from scraper import discovery
 
 # Setup logging to both console and file
 logger = logging.getLogger(__name__)
@@ -29,138 +31,112 @@ logger.addHandler(fh)
 logger.propagate = False
 
 DATA_DIR = 'data'
-PRODUCTS_FILE = os.path.join(DATA_DIR, 'products.json')
-CATEGORIES_FILE = os.path.join(DATA_DIR, 'categories.json')
-FAILED_FILE = os.path.join(DATA_DIR, 'failed_urls.json')
-
-DEFAULT_SITE = 'https://www.phoneplacekenya.com'
-
-# Sitemaps whose name suggests they list products. WooCommerce/Yoast name these
-# product-sitemap.xml, wp-sitemap-posts-product-1.xml, etc.
-# Note: no 'item' here - the word "sitemap" itself contains "item", so it would
-# match every sitemap on the site.
-PRODUCT_SITEMAP_HINTS = ('product', 'produkt')
-# ...but the same generators also emit product_cat-sitemap.xml, pa_colour-sitemap.xml
-# and friends, which list category/tag/attribute archive pages rather than products.
-TAXONOMY_SITEMAP_HINTS = ('product_cat', 'product-cat', 'product_tag', 'product-tag',
-                          'category', 'categories', 'product_brand', 'product-brand',
-                          'brand', 'tag', 'pa_', 'attribute')
-# Fallback for sites whose sitemaps aren't helpfully named. Deliberately narrow:
-# '/shop/' and '/store/' are excluded because they match catalogue index and
-# filtered-archive pages far more often than individual products.
-PRODUCT_URL_HINTS = ('/product/', '/produkt/', '/item/')
-# Catalogue roots that show up inside product sitemaps but aren't products.
-ARCHIVE_ROOT_PATHS = ('/shop/', '/store/', '/products/', '/shop', '/store', '/products')
-
-SITEMAP_FALLBACK_PATHS = ('/sitemap_index.xml', '/sitemap.xml', '/wp-sitemap.xml', '/product-sitemap.xml')
+# Live run state, shared by whichever site is being scraped, so the dashboard
+# always has a single place to poll for progress.
+PROGRESS_FILE = os.path.join(DATA_DIR, 'progress.json')
+ACTIVE_SITE_FILE = os.path.join(DATA_DIR, '.active_site')
 
 
 def update_progress(current, total, eta=0):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(os.path.join(DATA_DIR, 'progress.json'), 'w') as f:
+    with open(PROGRESS_FILE, 'w') as f:
         json.dump({'current': current, 'total': total, 'eta': eta}, f)
 
 
-def discover_product_urls(client, parser, site_url):
-    """Walk a store's sitemaps and collect every product URL.
+def site_folder_name(url):
+    """Folder name for a store, derived from its domain.
 
-    Works against any WordPress/WooCommerce-style store: reads robots.txt for
-    Sitemap: directives, falls back to the conventional sitemap locations, then
-    walks sitemap indexes down to their leaf sitemaps.
+    'https://www.example.co.ke/product/x' -> 'example.co.ke'. The leading www.
+    is dropped so the same store entered either way maps to one folder.
     """
-    parsed = urlparse(site_url if '://' in site_url else f'https://{site_url}')
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    logger.info(f"Discovering sitemaps for {base} ...")
-
-    queue = []
-    robots = client.fetch_page(f"{base}/robots.txt", retries=1)
-    if robots:
-        for line in robots.splitlines():
-            if line.strip().lower().startswith('sitemap:'):
-                advertised = line.split(':', 1)[1].strip()
-                if advertised:
-                    queue.append(advertised)
-        if queue:
-            logger.info(f"robots.txt advertised {len(queue)} sitemap(s)")
-
-    for path in SITEMAP_FALLBACK_PATHS:
-        candidate = base + path
-        if candidate not in queue:
-            queue.append(candidate)
-
-    seen_sitemaps = set()
-    from_product_sitemaps = []   # URLs out of sitemaps explicitly listing products
-    all_leaf_urls = []           # every page URL seen, used only as a fallback
-
-    while queue:
-        sitemap_url = queue.pop(0)
-        if sitemap_url in seen_sitemaps:
-            continue
-        seen_sitemaps.add(sitemap_url)
-
-        xml = client.fetch_page(sitemap_url, retries=1)
-        if not xml:
-            continue
-        locs = parser.parse_sitemap(xml)
-        if not locs:
-            continue
-
-        # A sitemap index points at more sitemaps; a urlset points at pages.
-        if '<sitemapindex' in xml[:2000].lower():
-            logger.info(f"Sitemap index {sitemap_url} -> {len(locs)} child sitemap(s)")
-            queue.extend(locs)
-            continue
-
-        name = sitemap_url.lower()
-        is_product_sitemap = (any(h in name for h in PRODUCT_SITEMAP_HINTS)
-                              and not any(t in name for t in TAXONOMY_SITEMAP_HINTS))
-
-        pages = [u for u in locs if '/wp-content/' not in u and not _is_archive_root(u)]
-        all_leaf_urls.extend(pages)
-        if is_product_sitemap:
-            logger.info(f"Product sitemap {sitemap_url} -> {len(pages)} product URL(s)")
-            from_product_sitemaps.extend(pages)
-
-    # A store that publishes product sitemaps is authoritative about its own
-    # catalogue, so trust those exclusively. Only when none exist do we fall back
-    # to guessing products from URL shape.
-    if from_product_sitemaps:
-        candidates = from_product_sitemaps
-    else:
-        logger.info("No product sitemap found - falling back to URL pattern matching")
-        candidates = [u for u in all_leaf_urls if any(h in u.lower() for h in PRODUCT_URL_HINTS)]
-
-    return list(dict.fromkeys(candidates))
+    parsed = urlparse(url if '://' in url else f'https://{url}')
+    host = (parsed.netloc or parsed.path).lower().split('/')[0].split('@')[-1]
+    if host.startswith('www.'):
+        host = host[4:]
+    return re.sub(r'[^a-z0-9.\-]', '_', host) or 'unknown-site'
 
 
-def _is_archive_root(url):
-    path = urlparse(url).path.rstrip('/')
-    return (path or '/') in [p.rstrip('/') or '/' for p in ARCHIVE_ROOT_PATHS]
+def resolve_site_dir(url, new_version=False):
+    """Where this run should write. Each store gets its own folder under data/.
+
+    With new_version, the existing folder is left untouched and a sibling
+    '<site>_v2_<timestamp>' (v3, v4, ...) is created instead.
+    """
+    base = site_folder_name(url)
+    root = os.path.join(DATA_DIR, base)
+    if not new_version or not os.path.isdir(root):
+        return root
+
+    existing = os.listdir(DATA_DIR) if os.path.isdir(DATA_DIR) else []
+    version = 2
+    while any(d.startswith(f"{base}_v{version}_") for d in existing):
+        version += 1
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    return os.path.join(DATA_DIR, f"{base}_v{version}_{stamp}")
 
 
-def load_existing_products(resume):
+def site_paths(site_dir):
+    return {
+        'dir': site_dir,
+        'products': os.path.join(site_dir, 'products.json'),
+        'categories': os.path.join(site_dir, 'categories.json'),
+        'failed': os.path.join(site_dir, 'failed_urls.json'),
+        'structured': os.path.join(site_dir, 'structured'),
+        'images': os.path.join(site_dir, 'images'),
+    }
+
+
+def set_active_site(folder_name):
+    """Record which site the dashboard should display."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(ACTIVE_SITE_FILE, 'w', encoding='utf-8') as f:
+        f.write(folder_name)
+
+
+def discover_product_urls(client, parser, site_url):
+    """Find every product URL on a store (see scraper/discovery.py)."""
+    return discovery.discover_products(client, parser, site_url)['urls']
+
+
+def load_existing_products(resume, paths):
     """Return (products, scraped_urls) from a previous run so it can be continued."""
-    if not resume or not os.path.exists(PRODUCTS_FILE):
+    if not resume or not os.path.exists(paths['products']):
         return [], set()
     try:
-        with open(PRODUCTS_FILE, 'r', encoding='utf-8') as f:
+        with open(paths['products'], 'r', encoding='utf-8') as f:
             products = json.load(f)
     except Exception as e:
-        logger.warning(f"Could not read existing {PRODUCTS_FILE} ({e}) - starting fresh.")
+        logger.warning(f"Could not read existing {paths['products']} ({e}) - starting fresh.")
         return [], set()
     # Only records that actually parsed count as done; empty/junk rows get re-scraped.
     valid = [p for p in products if p.get('url') and p.get('title')]
     return valid, {p['url'] for p in valid}
 
 
+def write_json_atomic(path, payload):
+    """Write JSON via a temp file + rename.
+
+    These files are rewritten every few seconds while the dashboard polls them.
+    Writing in place lets a reader observe a half-written file and fail to
+    parse it; renaming swaps the file in as a single step so a reader always
+    sees either the old copy or the new one.
+    """
+    tmp = f"{path}.tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 def save_results(state):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(PRODUCTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(state['products'], f, indent=2, ensure_ascii=False)
-    with open(CATEGORIES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(sorted(state['categories']), f, indent=2, ensure_ascii=False)
-    with open(FAILED_FILE, 'w', encoding='utf-8') as f:
-        json.dump(state['failed'], f, indent=2, ensure_ascii=False)
+    paths = state['paths']
+    try:
+        os.makedirs(paths['dir'], exist_ok=True)
+        write_json_atomic(paths['products'], state['products'])
+        write_json_atomic(paths['categories'], sorted(state['categories']))
+        write_json_atomic(paths['failed'], state['failed'])
+    except Exception as e:
+        # Losing one periodic flush must never end the run - the next one retries.
+        logger.error(f"Could not save results: {e}")
 
 
 def mark_completed(state, url, note):
@@ -177,7 +153,35 @@ def mark_completed(state, url, note):
         save_results(state)
 
 
+def safe_path_segment(value, max_len=60):
+    """Filesystem-safe, length-capped folder name.
+
+    Product titles and category names go straight into the directory tree, and
+    Windows still caps a full path at 260 characters by default - long titles
+    nested under a few categories will blow past that and every write for that
+    product fails.
+    """
+    cleaned = re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9]', '_', value or '')).strip('_')
+    return cleaned[:max_len].strip('_') or 'unnamed'
+
+
 async def scrape_product(url, async_session, parser, downloader, semaphore, state):
+    """Scrape one product. Never raises - a single bad page must not end the run."""
+    try:
+        return await _scrape_product_inner(url, async_session, parser, downloader, semaphore, state)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        state['failed'].append({'url': url, 'reason': f'{type(e).__name__}: {e}'})
+        logger.error(f"Unexpected error on {url}: {type(e).__name__}: {e}")
+        try:
+            mark_completed(state, url, 'Errored')
+        except Exception:
+            pass
+        return None
+
+
+async def _scrape_product_inner(url, async_session, parser, downloader, semaphore, state):
     async with semaphore:
         html, reason = await state['client'].fetch_page_async(async_session, url)
         if not html:
@@ -193,14 +197,11 @@ async def scrape_product(url, async_session, parser, downloader, semaphore, stat
 
         # Determine primary category path
         cats = data.get('categories', [])
-        cat_path = "Uncategorized"
-        if cats:
-            cat_path = "/".join([re.sub(r'[^a-zA-Z0-9]', '_', c).strip('_') for c in cats])
+        cat_path = os.path.join(*[safe_path_segment(c, 40) for c in cats]) if cats else "Uncategorized"
 
-        safe_name = re.sub(r'[^a-zA-Z0-9]', '_', data.get('title') or url.split('/')[-2])
-        safe_name = re.sub(r'_+', '_', safe_name).strip('_')
+        safe_name = safe_path_segment(data.get('title') or url.rstrip('/').split('/')[-1])
 
-        structured_dir = os.path.join(DATA_DIR, 'structured', cat_path, safe_name)
+        structured_dir = os.path.join(state['paths']['structured'], cat_path, safe_name)
         os.makedirs(structured_dir, exist_ok=True)
 
         # Save descriptions
@@ -237,10 +238,10 @@ async def scrape_product(url, async_session, parser, downloader, semaphore, stat
         return data
 
 
-async def run_concurrent_scraper(product_urls, workers, existing_products=None):
+async def run_concurrent_scraper(product_urls, workers, paths, existing_products=None):
     parser = Parser()
     # Concurrency limit for image downloads
-    downloader = ImageDownloader(base_dir=os.path.join(DATA_DIR, 'images'), concurrency=workers)
+    downloader = ImageDownloader(base_dir=paths['images'], concurrency=workers)
     # Concurrency limit for product page fetching
     semaphore = asyncio.Semaphore(workers)
 
@@ -252,6 +253,7 @@ async def run_concurrent_scraper(product_urls, workers, existing_products=None):
         'categories': set(),
         'failed': [],
         'client': ScraperClient(),
+        'paths': paths,
         'start_time': time.time(),
     }
     for product in existing_products:
@@ -260,36 +262,54 @@ async def run_concurrent_scraper(product_urls, workers, existing_products=None):
 
     update_progress(0, state['total'], 0)
 
-    async with AsyncSession(impersonate="chrome") as async_session:
-        tasks = [
-            scrape_product(url, async_session, parser, downloader, semaphore, state)
-            for url in product_urls
-        ]
-        await asyncio.gather(*tasks)
+    try:
+        async with AsyncSession(impersonate="chrome") as async_session:
+            tasks = [
+                scrape_product(url, async_session, parser, downloader, semaphore, state)
+                for url in product_urls
+            ]
+            # return_exceptions so one unexpected failure can never abandon the
+            # remaining products - the run always reaches the end or is stopped.
+            await asyncio.gather(*tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        logger.warning("Scrape cancelled - saving what was collected so far.")
+    except Exception as e:
+        logger.error(f"Scrape loop aborted ({type(e).__name__}: {e}) - saving partial results.")
 
     save_results(state)
 
     scraped_now = len(state['products']) - len(existing_products)
     logger.info(f"Scraped {scraped_now} new product(s); {len(state['products'])} total in database.")
     if state['failed']:
-        logger.warning(f"{len(state['failed'])} URL(s) failed - see {FAILED_FILE} "
+        logger.warning(f"{len(state['failed'])} URL(s) failed - see {paths['failed']} "
                        f"(re-run to retry them automatically)")
     else:
         logger.info("No failures.")
 
 
-def run_scraper(limit=None, target_url=None, workers=8, resume=True, single_product=False):
+def run_scraper(limit=None, target_url=None, workers=8, resume=True,
+                single_product=False, new_version=False):
+    if not target_url:
+        logger.error("No target URL provided. Pass --target_url with any URL on the "
+                     "store you want to scrape.")
+        update_progress(0, 0)
+        return
+
     client = ScraperClient()
     parser = Parser()
 
-    site = target_url or DEFAULT_SITE
+    site_dir = resolve_site_dir(target_url, new_version)
+    paths = site_paths(site_dir)
+    os.makedirs(site_dir, exist_ok=True)
+    set_active_site(os.path.basename(site_dir))
+    logger.info(f"Output directory: {site_dir}")
 
-    if single_product and target_url:
+    if single_product:
         logger.info(f"Single-product mode: {target_url}")
         product_urls = [target_url]
     else:
-        logger.info(f"Crawling entire site: {site}")
-        product_urls = discover_product_urls(client, parser, site)
+        logger.info(f"Crawling entire site: {target_url}")
+        product_urls = discover_product_urls(client, parser, target_url)
         logger.info(f"Found {len(product_urls)} total product URLs.")
 
     if not product_urls:
@@ -298,7 +318,7 @@ def run_scraper(limit=None, target_url=None, workers=8, resume=True, single_prod
         update_progress(0, 0)
         return
 
-    existing_products, done_urls = load_existing_products(resume)
+    existing_products, done_urls = load_existing_products(resume, paths)
     if done_urls:
         before = len(product_urls)
         product_urls = [u for u in product_urls if u not in done_urls]
@@ -315,7 +335,7 @@ def run_scraper(limit=None, target_url=None, workers=8, resume=True, single_prod
         return
 
     logger.info(f"Starting concurrent scraping of {len(product_urls)} products with {workers} workers...")
-    asyncio.run(run_concurrent_scraper(product_urls, workers, existing_products))
+    asyncio.run(run_concurrent_scraper(product_urls, workers, paths, existing_products))
     logger.info("Scraping finished successfully!")
 
 
@@ -330,7 +350,10 @@ if __name__ == '__main__':
                         help='Re-scrape everything instead of skipping already-scraped products')
     parser.add_argument('--single-product', action='store_true',
                         help='Treat --target_url as one product page instead of crawling the site')
+    parser.add_argument('--new-version', action='store_true',
+                        help='Scrape into a new timestamped folder instead of updating the existing one')
     args = parser.parse_args()
 
     run_scraper(limit=args.limit, target_url=args.target_url, workers=args.workers,
-                resume=not args.no_resume, single_product=args.single_product)
+                resume=not args.no_resume, single_product=args.single_product,
+                new_version=args.new_version)

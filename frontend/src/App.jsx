@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Package, Folder, Terminal, Download, StopCircle, PlayCircle, Menu, Moon, Sun, Monitor, Loader2, Image as ImageIcon, CheckCircle, ChevronRight, X, Search, ChevronLeft, Filter, LayoutGrid, List, RefreshCw, Users, Activity, Server, Database, HardDrive, Globe, Cpu, FileText, Layers, AlertTriangle, XCircle, ExternalLink, FileJson2, FileType } from 'lucide-react';
+import { Package, Folder, Terminal, Download, StopCircle, PlayCircle, Menu, Moon, Sun, Monitor, Loader2, Image as ImageIcon, CheckCircle, ChevronRight, X, Search, ChevronLeft, Filter, LayoutGrid, List, RefreshCw, Users, Activity, Server, Database, HardDrive, Globe, Cpu, FileText, Layers, AlertTriangle, XCircle, ExternalLink, FileJson2, FileType, Trash2 } from 'lucide-react';
 import { marked } from 'marked';
 import './index.css';
 
@@ -28,6 +28,18 @@ export default function App() {
   const [listMode, setListMode] = useState(false);
   const [stats, setStats] = useState({ total_products: 0, total_categories: 0, total_brands: 0, total_images: 0 });
   const [systemStatus, setSystemStatus] = useState({ overall: 'operational', checked_at: null, services: [] });
+  const [sites, setSites] = useState([]);
+  const [activeSite, setActiveSite] = useState(null);
+  const [siteCheck, setSiteCheck] = useState(null);
+  const [siteAnalysis, setSiteAnalysis] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [scrapeMode, setScrapeMode] = useState('update');
+  const [wipeOpen, setWipeOpen] = useState(false);
+  const [wiping, setWiping] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportSites, setExportSites] = useState([]);
+  const [exportFormats, setExportFormats] = useState(['csv']);
+  const [exportClean, setExportClean] = useState(true);
   
   const [files, setFiles] = useState([]);
   const [currentPath, setCurrentPath] = useState([]);
@@ -63,11 +75,13 @@ export default function App() {
     fetchFiles();
     fetchStatus();
     fetchSystemStatus();
+    fetchSites();
     const interval = setInterval(() => {
       fetchLogs();
       fetchProgress();
       fetchStatus();
       fetchSystemStatus();
+      fetchSites();
     }, 2000);
     return () => clearInterval(interval);
   }, []);
@@ -115,6 +129,89 @@ export default function App() {
       const data = await res.json();
       setSystemStatus(data);
     } catch {}
+  };
+
+  const fetchSites = async () => {
+    try {
+      const res = await fetch(`${API}/api/sites`);
+      const data = await res.json();
+      setSites(data.sites || []);
+      setActiveSite(data.active || null);
+    } catch {}
+  };
+
+  const switchSite = async (name) => {
+    try {
+      await fetch(`${API}/api/sites/active`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      setActiveSite(name);
+      setPage(1);
+      fetchProducts();
+      fetchStats();
+      fetchFiles();
+      setCurrentPath([]);
+    } catch {}
+  };
+
+  const wipeEverything = async () => {
+    setWiping(true);
+    try {
+      const res = await fetch(`${API}/api/system/wipe`, { method: 'POST' });
+      const data = await res.json();
+      if (data.status === 'success') {
+        setWipeOpen(false);
+        setProducts([]);
+        setStats({ total_products: 0, total_categories: 0, total_brands: 0, total_images: 0 });
+        setProgress({ current: 0, total: 0, eta: 0 });
+        setLogs([]);
+        setCurrentPath([]);
+        setSiteCheck(null);
+        await Promise.all([fetchSites(), fetchFiles(), fetchSystemStatus()]);
+      }
+    } catch {}
+    setWiping(false);
+  };
+
+  const openExport = () => {
+    // Default to the site you're already looking at.
+    setExportSites(activeSite ? [activeSite] : sites.slice(0, 1).map(s => s.name));
+    setExportFormats(['csv']);
+    setExportClean(true);
+    setExportOpen(true);
+  };
+
+  const toggleIn = (list, value) =>
+    list.includes(value) ? list.filter(v => v !== value) : [...list, value];
+
+  const runBundleExport = async () => {
+    setExporting('bundle');
+    try {
+      const res = await fetch(`${API}/api/export/bundle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sites: exportSites, formats: exportFormats, clean: exportClean }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error || 'Export failed');
+
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename=([^;]+)/);
+      const blob = await res.blob();
+      const href = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = (match ? match[1] : 'export.zip').replace(/["']/g, '').trim();
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(href);
+      document.body.removeChild(a);
+      setExportOpen(false);
+    } catch (e) {
+      console.error('Export failed', e);
+    }
+    setExporting(null);
   };
 
   const handleExport = async (type, endpoint) => {
@@ -178,10 +275,26 @@ export default function App() {
 
   // Submitting the form only asks for confirmation — a scrape is a long, heavy
   // job, and pressing Enter in the URL box used to launch one instantly.
-  const requestScrape = (e) => {
+  const requestScrape = async (e) => {
     e.preventDefault();
     if (scraping || loading) return;
+    setSiteCheck(null);
+    setSiteAnalysis(null);
+    setAnalyzing(true);
+    setScrapeMode('update');
     setConfirmOpen(true);
+    try {
+      const res = await fetch(`${API}/api/site/check?url=${encodeURIComponent(url)}`);
+      const check = await res.json();
+      setSiteCheck(check);
+      if (check.valid) {
+        const ares = await fetch(`${API}/api/site/analyze?url=${encodeURIComponent(url)}`);
+        setSiteAnalysis(await ares.json());
+      }
+    } catch {
+      setSiteCheck({ valid: false, message: 'Could not reach the backend.' });
+    }
+    setAnalyzing(false);
   };
 
   const startScrape = async () => {
@@ -191,12 +304,17 @@ export default function App() {
       const res = await fetch(`${API}/api/scrape`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url || null, workers: workers })
+        body: JSON.stringify({
+          url: url,
+          workers: workers,
+          new_version: scrapeMode === 'new_version',
+        })
       });
       const data = await res.json();
       if (data.status === 'success') {
         setUrl('');
         setScraping(true);
+        fetchSites();
       }
     } catch {}
     setLoading(false);
@@ -248,6 +366,7 @@ export default function App() {
     fetchFiles(newPath.length > 0 ? newPath[newPath.length - 1].path : '');
   };
 
+  const activeSiteInfo = sites.find(s => s.name === activeSite) || null;
   const percentage = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
   const hasProducts = products.length > 0 || search || category;
 
@@ -306,52 +425,19 @@ export default function App() {
         </div>
 
         <div className="mt-auto p-4 border-t border-white-light dark:border-[#1b2e4b]">
-            <div className="flex flex-col gap-2 mb-4">
-              <button onClick={() => handleExport('json', '/api/export/json')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'json' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export JSON
-              </button>
-              
-              <button onClick={() => handleExport('csv_clean', '/api/export/csv?clean=true')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'csv_clean' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export CSV (Clean)
-              </button>
-              <button onClick={() => handleExport('csv_raw', '/api/export/csv?clean=false')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'csv_raw' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export CSV (Raw HTML)
-              </button>
-              
-              <button onClick={() => handleExport('excel_clean', '/api/export/excel?clean=true')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'excel_clean' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Excel (Clean)
-              </button>
-              <button onClick={() => handleExport('excel_raw', '/api/export/excel?clean=false')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'excel_raw' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Excel (Raw HTML)
-              </button>
-
-              <button onClick={() => handleExport('xml', '/api/export/xml')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'xml' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export XML
-              </button>
-           </div>
-           
-           <div className="flex flex-col gap-2 mb-4">
-              <p className="text-xs font-bold text-[#888ea8] uppercase tracking-wider mb-1">Data Lists</p>
-              <button onClick={() => handleExport('categories_csv', '/api/export/categories_csv')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'categories_csv' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Categories
-              </button>
-              <button onClick={() => handleExport('brands_csv', '/api/export/brands_csv')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'brands_csv' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Brands
-              </button>
-           </div>
-           
-           <div className="flex flex-col gap-2">
-              <p className="text-xs font-bold text-[#888ea8] uppercase tracking-wider mb-1">ZIP Archives</p>
-              <button onClick={() => handleExport('zip_all', '/api/export/structured')} disabled={exporting !== null} className="btn btn-outline-secondary w-full gap-2 text-left justify-center">
-                {exporting === 'zip_all' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Everything
-              </button>
-              <button onClick={() => handleExport('zip_data', '/api/export/structured/data')} disabled={exporting !== null} className="btn btn-outline-secondary w-full gap-2 text-left justify-center">
-                {exporting === 'zip_data' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Products Only
-              </button>
-              <button onClick={() => handleExport('zip_images', '/api/export/structured/images')} disabled={exporting !== null} className="btn btn-outline-secondary w-full gap-2 text-left justify-center">
-                {exporting === 'zip_images' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Images Only
-              </button>
-           </div>
+          <button
+            onClick={openExport}
+            disabled={sites.length === 0}
+            className="btn btn-outline-primary w-full gap-2 justify-center disabled:opacity-40 disabled:cursor-not-allowed"
+            title={sites.length === 0 ? 'Scrape a site first' : 'Export scraped data'}
+          >
+            <Download className="w-4 h-4" /> Export Data
+          </button>
+          <p className="text-[11px] text-[#888ea8] text-center mt-2 leading-relaxed">
+            {sites.length === 0
+              ? 'Nothing to export yet'
+              : `${sites.length} site${sites.length === 1 ? '' : 's'} available`}
+          </p>
         </div>
       </aside>
 
@@ -368,13 +454,27 @@ export default function App() {
               {view === 'logs' && 'Terminal Output'}
               {view === 'status' && 'System Status'}
             </h1>
+
+            {activeSiteInfo && (
+              <div className="hidden md:flex items-center gap-2.5 pl-4 border-l border-white-light dark:border-[#1b2e4b] min-w-0">
+                <Globe className="w-4 h-4 text-primary flex-none" />
+                <div className="min-w-0">
+                  <p className="font-bold text-black dark:text-white text-sm leading-tight truncate max-w-[240px]">
+                    {activeSiteInfo.name}
+                  </p>
+                  <p className="text-[11px] text-[#888ea8] leading-tight">
+                    Last scraped {formatRelativeTime(activeSiteInfo.modified)}
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-4 flex-1 justify-end ml-4">
              <form onSubmit={requestScrape} className="flex items-center gap-2 flex-1 max-w-4xl justify-end">
                 <input
                   type="text"
-                  placeholder="Store URL — whole catalogue is crawled (blank = PhonePlaceKenya)"
+                  placeholder="Store URL — the whole catalogue is discovered and crawled"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                   disabled={scraping}
@@ -444,6 +544,62 @@ export default function App() {
           
           {view === 'products' && (
             <div className="flex-1 flex flex-col h-full overflow-hidden">
+               {activeSiteInfo && (
+                 <div className="p-4 pb-0 bg-[#fafafa] dark:bg-[#060818]">
+                   <div className="panel p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-5 border-l-4 border-l-primary">
+                     <div className="flex items-center gap-4 min-w-0">
+                       <div className="w-12 h-12 rounded-full bg-primary/10 text-primary flex items-center justify-center flex-none">
+                         <Globe className="w-6 h-6" />
+                       </div>
+                       <div className="min-w-0">
+                         <p className="text-[10px] font-bold text-[#888ea8] uppercase tracking-wider mb-0.5">Currently viewing</p>
+                         <h3 className="text-xl font-bold text-black dark:text-white leading-tight truncate">
+                           {activeSiteInfo.name}
+                         </h3>
+                         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-xs text-[#888ea8]">
+                           <span className="flex items-center gap-1.5">
+                             <Package className="w-3.5 h-3.5" />
+                             {activeSiteInfo.products.toLocaleString()} products
+                           </span>
+                           <span className="flex items-center gap-1.5">
+                             <RefreshCw className="w-3.5 h-3.5" />
+                             Last scraped {formatRelativeTime(activeSiteInfo.modified)}
+                           </span>
+                           {activeSiteInfo.failed > 0 && (
+                             <span className="flex items-center gap-1.5 text-warning font-semibold">
+                               <AlertTriangle className="w-3.5 h-3.5" />
+                               {activeSiteInfo.failed.toLocaleString()} failed — re-run to retry
+                             </span>
+                           )}
+                         </div>
+                       </div>
+                     </div>
+
+                     {sites.length > 1 && (
+                       <div className="flex-none lg:text-right">
+                         <label className="block text-[10px] font-bold text-[#888ea8] uppercase tracking-wider mb-1.5">
+                           Switch to another scrape
+                         </label>
+                         <div className="relative flex items-center bg-white dark:bg-[#121e32] border border-white-light dark:border-[#17263c] rounded-md h-[38px] pl-3">
+                           <Layers className="w-4 h-4 text-[#888ea8] flex-none" />
+                           <select
+                             value={activeSite || ''}
+                             onChange={(e) => switchSite(e.target.value)}
+                             className="bg-transparent text-black dark:text-white font-semibold text-sm outline-none px-2 pr-3 cursor-pointer w-full lg:min-w-[260px]"
+                           >
+                             {sites.map(s => (
+                               <option key={s.name} value={s.name}>
+                                 {s.name} — {s.products.toLocaleString()} products
+                               </option>
+                             ))}
+                           </select>
+                         </div>
+                       </div>
+                     )}
+                   </div>
+                 </div>
+               )}
+
                {hasProducts && (
                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 p-4 pb-0 bg-[#fafafa] dark:bg-[#060818]">
                    <div className="panel p-4 flex items-center justify-between border-l-4 border-l-primary">
@@ -734,9 +890,14 @@ export default function App() {
                         </p>
                       </div>
                     </div>
-                    <button onClick={fetchSystemStatus} className="btn btn-outline-primary gap-2 self-start sm:self-auto">
-                      <RefreshCw className="w-4 h-4" /> Refresh
-                    </button>
+                    <div className="flex gap-2 self-start sm:self-auto">
+                      <button onClick={fetchSystemStatus} className="btn btn-outline-primary gap-2">
+                        <RefreshCw className="w-4 h-4" /> Refresh
+                      </button>
+                      <button onClick={() => setWipeOpen(true)} className="btn btn-outline-danger gap-2">
+                        <Trash2 className="w-4 h-4" /> Wipe All Data
+                      </button>
+                    </div>
                   </div>
                 );
               })()}
@@ -804,7 +965,7 @@ export default function App() {
               <div className="flex-1 space-y-6">
                 <div>
                   <h4 className="text-3xl font-bold text-secondary mb-2">{selectedProduct.price}</h4>
-                  <a href={selectedProduct.url} target="_blank" rel="noreferrer" className="text-primary hover:underline font-semibold text-[15px]">View on PhonePlaceKenya ↗</a>
+                  <a href={selectedProduct.url} target="_blank" rel="noreferrer" className="text-primary hover:underline font-semibold text-[15px]">View on store ↗</a>
                 </div>
                 
                 <div>
@@ -824,6 +985,204 @@ export default function App() {
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Export */}
+      {exportOpen && (() => {
+        const totalProducts = sites.filter(s => exportSites.includes(s.name))
+                                   .reduce((sum, s) => sum + s.products, 0);
+        const hasTabular = exportFormats.some(f => ['json', 'csv', 'excel', 'xml'].includes(f));
+        const isZip = exportSites.length > 1 || exportFormats.length > 1
+                      || exportFormats.some(f => f.startsWith('archive_'));
+        return (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setExportOpen(false)}>
+            <div className="bg-white dark:bg-[#0e1726] rounded-lg shadow-xl w-full max-w-3xl max-h-full flex flex-col overflow-hidden animate-[scaleIn_0.2s_ease-out]" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between gap-3 px-6 py-4 border-b border-white-light dark:border-[#1b2e4b]">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-full bg-primary/10 text-primary flex items-center justify-center flex-none">
+                    <Download className="w-5 h-5" />
+                  </div>
+                  <h3 className="text-lg font-bold text-black dark:text-white">Export data</h3>
+                </div>
+                <button onClick={() => setExportOpen(false)} className="p-1.5 rounded-md hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b] text-[#888ea8]">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="overflow-y-auto p-6 space-y-6">
+                <section>
+                  <div className="flex items-center justify-between mb-3">
+                    <h4 className="text-xs font-bold text-[#888ea8] uppercase tracking-wider">
+                      <span className="text-primary">1.</span> Choose sites
+                    </h4>
+                    {sites.length > 1 && (
+                      <button
+                        onClick={() => setExportSites(exportSites.length === sites.length ? [] : sites.map(s => s.name))}
+                        className="text-xs font-semibold text-primary hover:underline">
+                        {exportSites.length === sites.length ? 'Clear all' : 'Select all'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {sites.map(s => {
+                      const picked = exportSites.includes(s.name);
+                      return (
+                        <label key={s.name}
+                          className={`flex items-center gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
+                            picked ? 'border-primary bg-primary/5' : 'border-white-light dark:border-[#1b2e4b] hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b]'}`}>
+                          <input type="checkbox" checked={picked}
+                            onChange={() => setExportSites(toggleIn(exportSites, s.name))}
+                            className="accent-[#4361ee] flex-none" />
+                          <span className="min-w-0 flex-1">
+                            <span className="block font-semibold text-black dark:text-white text-sm truncate">{s.name}</span>
+                            <span className="block text-xs text-[#888ea8]">
+                              {s.products.toLocaleString()} products
+                              {s.failed > 0 && <span className="text-warning"> · {s.failed} failed</span>}
+                            </span>
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-xs font-bold text-[#888ea8] uppercase tracking-wider mb-3">
+                    <span className="text-primary">2.</span> Choose what to export
+                  </h4>
+                  <div className="space-y-4">
+                    {EXPORT_GROUPS.map(group => (
+                      <div key={group.title}>
+                        <p className="text-[11px] font-bold text-[#888ea8] uppercase tracking-wider mb-2">{group.title}</p>
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                          {group.items.map(item => {
+                            const picked = exportFormats.includes(item.id);
+                            const Icon = item.Icon;
+                            return (
+                              <button key={item.id}
+                                onClick={() => setExportFormats(toggleIn(exportFormats, item.id))}
+                                className={`flex items-start gap-2.5 p-3 rounded-md border text-left transition-colors ${
+                                  picked ? 'border-primary bg-primary/5' : 'border-white-light dark:border-[#1b2e4b] hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b]'}`}>
+                                <Icon className={`w-4 h-4 flex-none mt-0.5 ${picked ? 'text-primary' : 'text-[#888ea8]'}`} />
+                                <span className="min-w-0">
+                                  <span className="block font-semibold text-black dark:text-white text-sm leading-tight">{item.label}</span>
+                                  <span className="block text-[11px] text-[#888ea8] leading-snug mt-0.5">{item.desc}</span>
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
+                {hasTabular && (
+                  <section>
+                    <h4 className="text-xs font-bold text-[#888ea8] uppercase tracking-wider mb-3">
+                      <span className="text-primary">3.</span> Description formatting
+                    </h4>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {[
+                        { v: true, t: 'Clean text', d: 'HTML tags stripped — best for spreadsheets.' },
+                        { v: false, t: 'Raw HTML', d: 'Original markup preserved — best for re-import.' },
+                      ].map(o => (
+                        <label key={String(o.v)}
+                          className={`flex gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
+                            exportClean === o.v ? 'border-primary bg-primary/5' : 'border-white-light dark:border-[#1b2e4b] hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b]'}`}>
+                          <input type="radio" name="exportClean" checked={exportClean === o.v}
+                            onChange={() => setExportClean(o.v)} className="mt-1 accent-[#4361ee] flex-none" />
+                          <span>
+                            <span className="block font-semibold text-black dark:text-white text-sm">{o.t}</span>
+                            <span className="block text-[11px] text-[#888ea8] leading-snug">{o.d}</span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </section>
+                )}
+              </div>
+
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-6 py-4 border-t border-white-light dark:border-[#1b2e4b]">
+                <p className="text-xs text-[#888ea8]">
+                  {exportSites.length === 0 || exportFormats.length === 0 ? (
+                    <span className="text-warning font-semibold">Pick at least one site and one format.</span>
+                  ) : (
+                    <>
+                      <span className="font-semibold text-black dark:text-white">
+                        {exportFormats.length} format{exportFormats.length === 1 ? '' : 's'}
+                      </span>{' '}from{' '}
+                      <span className="font-semibold text-black dark:text-white">
+                        {exportSites.length} site{exportSites.length === 1 ? '' : 's'}
+                      </span>{' '}({totalProducts.toLocaleString()} products) · downloads as {isZip ? 'a ZIP' : 'a single file'}
+                    </>
+                  )}
+                </p>
+                <div className="flex justify-end gap-2">
+                  <button onClick={() => setExportOpen(false)} className="btn btn-outline-secondary">Cancel</button>
+                  <button onClick={runBundleExport}
+                    disabled={exporting !== null || exportSites.length === 0 || exportFormats.length === 0}
+                    className="btn btn-primary gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                    {exporting === 'bundle' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                    {exporting === 'bundle' ? 'Preparing…' : 'Download'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Wipe Everything */}
+      {wipeOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => !wiping && setWipeOpen(false)}>
+          <div className="bg-white dark:bg-[#0e1726] rounded-lg shadow-xl w-full max-w-lg flex flex-col overflow-hidden animate-[scaleIn_0.2s_ease-out]" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-3 px-6 py-4 border-b border-white-light dark:border-[#1b2e4b]">
+              <div className="w-10 h-10 rounded-full bg-danger/10 text-danger flex items-center justify-center flex-none">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <h3 className="text-lg font-bold text-black dark:text-white">Wipe all data?</h3>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <p className="text-[#888ea8] leading-relaxed">
+                This permanently deletes <strong className="text-black dark:text-white">every site
+                you have scraped</strong> — all products, images, markdown, exports, cached data
+                and the scraper log. It cannot be undone.
+              </p>
+
+              {sites.length > 0 && (
+                <div className="rounded-md border border-danger/30 bg-danger/5 p-4 space-y-1.5">
+                  <p className="text-xs font-bold text-danger uppercase tracking-wider mb-2">
+                    {sites.length} site{sites.length === 1 ? '' : 's'} will be deleted
+                  </p>
+                  {sites.map(s => (
+                    <div key={s.name} className="flex items-center justify-between gap-4 text-sm">
+                      <span className="font-mono text-black dark:text-white truncate">{s.name}</span>
+                      <span className="text-[#888ea8] flex-none">{s.products.toLocaleString()} products</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {sites.length === 0 && (
+                <p className="text-sm text-[#888ea8]">There is no scraped data to delete right now.</p>
+              )}
+
+              <p className="text-xs text-[#888ea8]">
+                Export anything you want to keep before continuing.
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-2 px-6 py-4 border-t border-white-light dark:border-[#1b2e4b]">
+              <button onClick={() => setWipeOpen(false)} disabled={wiping} className="btn btn-outline-secondary">Cancel</button>
+              <button onClick={wipeEverything} disabled={wiping} className="btn btn-danger gap-2 disabled:opacity-50">
+                {wiping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                {wiping ? 'Wiping…' : 'Delete Everything'}
+              </button>
             </div>
           </div>
         </div>
@@ -849,26 +1208,174 @@ export default function App() {
 
               <div className="rounded-md border border-white-light dark:border-[#1b2e4b] divide-y divide-white-light dark:divide-[#1b2e4b]">
                 <div className="flex items-start justify-between gap-4 px-4 py-3">
-                  <span className="text-xs font-bold text-[#888ea8] uppercase tracking-wider flex-none pt-0.5">Target</span>
+                  <span className="text-xs font-bold text-[#888ea8] uppercase tracking-wider flex-none pt-0.5">Store</span>
                   <span className="text-black dark:text-white font-semibold text-sm text-right break-all">
-                    {url || 'PhonePlaceKenya (default)'}
+                    {url || <span className="text-danger">No URL entered</span>}
                   </span>
                 </div>
+                {siteCheck?.valid && (
+                  <div className="flex items-center justify-between gap-4 px-4 py-3">
+                    <span className="text-xs font-bold text-[#888ea8] uppercase tracking-wider">Saves to</span>
+                    <span className="text-black dark:text-white font-semibold text-sm font-mono">
+                      data/{scrapeMode === 'new_version' ? `${siteCheck.site}_v${siteCheck.versions + 2}_…` : siteCheck.site}
+                    </span>
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-4 px-4 py-3">
                   <span className="text-xs font-bold text-[#888ea8] uppercase tracking-wider">Concurrent workers</span>
                   <span className="text-black dark:text-white font-semibold text-sm">{workers}</span>
                 </div>
               </div>
 
-              <p className="text-xs text-[#888ea8]">
-                Products already scraped are skipped automatically, so it's safe to re-run
-                this to fill in anything that failed.
-              </p>
+              {siteCheck && !siteCheck.valid && (
+                <p className="text-sm text-danger font-semibold">{siteCheck.message}</p>
+              )}
+
+              {analyzing && (
+                <div className="flex items-center gap-3 text-[#888ea8] py-3 px-4 rounded-md border border-white-light dark:border-[#1b2e4b]">
+                  <Loader2 className="w-4 h-4 animate-spin flex-none" />
+                  <span className="text-sm">Identifying the store platform…</span>
+                </div>
+              )}
+
+              {siteAnalysis && !analyzing && (() => {
+                const p = siteAnalysis.platform || {};
+                const tone = !siteAnalysis.reachable ? 'danger' : p.supported ? 'success' : 'warning';
+                const toneBox = { success: 'bg-success/10 text-success', warning: 'bg-warning/10 text-warning', danger: 'bg-danger/10 text-danger' }[tone];
+                const PIcon = !siteAnalysis.reachable ? XCircle : p.supported ? CheckCircle : AlertTriangle;
+                const wp = siteAnalysis.wordpress;
+                return (
+                  <div className="rounded-md border border-white-light dark:border-[#1b2e4b] overflow-hidden">
+                    <div className="flex items-center gap-3 px-4 py-3 border-b border-white-light dark:border-[#1b2e4b]">
+                      <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-none ${toneBox}`}>
+                        <PIcon className="w-4 h-4" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-bold text-[#888ea8] uppercase tracking-wider">Detected platform</p>
+                        <p className="font-bold text-black dark:text-white text-[15px] leading-tight">{p.name || 'Unknown'}</p>
+                      </div>
+                      {p.confidence && p.confidence !== 'none' && (
+                        <span className={`badge ml-auto flex-none ${p.supported ? 'badge-success' : 'badge-warning'}`}>
+                          {p.confidence} confidence
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="px-4 py-3 space-y-3 text-xs">
+                      {p.evidence?.length > 0 && (
+                        <div>
+                          <p className="font-bold text-[#888ea8] uppercase tracking-wider mb-1.5">Identified by</p>
+                          <ul className="space-y-1">
+                            {p.evidence.map((ev, i) => (
+                              <li key={i} className="flex gap-2 text-black dark:text-[#c5d0e6]">
+                                <CheckCircle className="w-3.5 h-3.5 text-success flex-none mt-0.5" />{ev}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {wp && (
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                          {wp.version && <Detail label="WordPress" value={wp.version} />}
+                          {wp.themes?.length > 0 && <Detail label="Theme" value={wp.themes.join(', ')} />}
+                          <Detail label="Plugins found" value={`${wp.plugin_count}`} />
+                        </div>
+                      )}
+
+                      {wp?.plugins?.length > 0 && (
+                        <div>
+                          <p className="font-bold text-[#888ea8] uppercase tracking-wider mb-1.5">Plugins</p>
+                          <div className="flex flex-wrap gap-1">
+                            {wp.plugins.slice(0, 12).map(pl => <span key={pl} className="badge">{pl}</span>)}
+                            {wp.plugins.length > 12 && <span className="badge">+{wp.plugins.length - 12} more</span>}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-2 pt-1">
+                        <Detail label="robots.txt" value={siteAnalysis.robots_txt ? 'Found' : 'Not found'} ok={siteAnalysis.robots_txt} />
+                        <Detail label="Sitemaps" value={siteAnalysis.sitemaps?.length ? `${siteAnalysis.sitemaps.length} indexed` : 'None'} ok={!!siteAnalysis.sitemaps?.length} />
+                        <Detail label="Product sitemaps" value={siteAnalysis.product_sitemaps?.length ? `${siteAnalysis.product_sitemaps.length} found` : 'None'} ok={!!siteAnalysis.product_sitemaps?.length} />
+                        <Detail label="Discovery method" value={DISCOVERY_LABELS[siteAnalysis.strategy] || 'Listing crawl'} />
+                      </div>
+
+                      {siteAnalysis.apis?.length > 0 && (
+                        <div>
+                          <p className="font-bold text-[#888ea8] uppercase tracking-wider mb-1.5">APIs available</p>
+                          {siteAnalysis.apis.map((a, i) => (
+                            <div key={i} className="flex items-center justify-between gap-3 text-black dark:text-[#c5d0e6]">
+                              <span className="flex gap-2"><CheckCircle className="w-3.5 h-3.5 text-success flex-none mt-0.5" />{a.name}</span>
+                              {a.products != null && <span className="font-semibold flex-none">{a.products.toLocaleString()} products</span>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {siteAnalysis.estimated_products != null && (
+                        <div className="flex items-center justify-between pt-2 border-t border-white-light dark:border-[#1b2e4b]">
+                          <span className="font-bold text-[#888ea8] uppercase tracking-wider">Products to scrape</span>
+                          <span className="text-lg font-bold text-primary">{siteAnalysis.estimated_products.toLocaleString()}</span>
+                        </div>
+                      )}
+
+                      {siteAnalysis.warnings?.map((w, i) => (
+                        <p key={i} className="flex gap-2 text-warning leading-relaxed">
+                          <AlertTriangle className="w-3.5 h-3.5 flex-none mt-0.5" />{w}
+                        </p>
+                      ))}
+                      {siteAnalysis.notes?.map((n, i) => (
+                        <p key={i} className="flex gap-2 text-success leading-relaxed">
+                          <CheckCircle className="w-3.5 h-3.5 flex-none mt-0.5" />{n}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {siteCheck?.valid && siteCheck.exists && (
+                <div className="space-y-2">
+                  <p className="text-sm text-black dark:text-white font-semibold">
+                    You've already scraped <span className="font-mono">{siteCheck.site}</span>
+                    {' '}({siteCheck.products.toLocaleString()} products). What should happen?
+                  </p>
+                  {[
+                    { id: 'update', title: 'Update the existing data',
+                      desc: 'Keeps what you have and fills in anything missing or previously failed.' },
+                    { id: 'new_version', title: 'Save as a new version',
+                      desc: 'Leaves the current data untouched and scrapes into a new timestamped folder.' },
+                  ].map(opt => (
+                    <label key={opt.id}
+                      className={`flex gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
+                        scrapeMode === opt.id
+                          ? 'border-primary bg-primary/5'
+                          : 'border-white-light dark:border-[#1b2e4b] hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b]'
+                      }`}>
+                      <input type="radio" name="scrapeMode" value={opt.id}
+                        checked={scrapeMode === opt.id}
+                        onChange={() => setScrapeMode(opt.id)}
+                        className="mt-1 accent-[#4361ee] flex-none" />
+                      <span>
+                        <span className="block font-semibold text-black dark:text-white text-sm">{opt.title}</span>
+                        <span className="block text-xs text-[#888ea8] leading-relaxed">{opt.desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              {siteCheck?.valid && !siteCheck.exists && (
+                <p className="text-xs text-[#888ea8]">
+                  This is a new store — its data will be kept in its own folder, separate from
+                  anything already scraped.
+                </p>
+              )}
             </div>
 
             <div className="flex justify-end gap-2 px-6 py-4 border-t border-white-light dark:border-[#1b2e4b]">
               <button onClick={() => setConfirmOpen(false)} className="btn btn-outline-secondary">Cancel</button>
-              <button onClick={startScrape} className="btn btn-primary gap-2">
+              <button onClick={startScrape} disabled={!siteCheck?.valid} className="btn btn-primary gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
                 <PlayCircle className="w-4 h-4" /> Start Scraping
               </button>
             </div>
@@ -1009,6 +1516,50 @@ function highlightJson(json) {
       }
       return `<span class="${cls}">${match}</span>`;
     }
+  );
+}
+
+const EXPORT_GROUPS = [
+  {
+    title: 'Product data',
+    items: [
+      { id: 'csv', label: 'CSV', desc: 'Spreadsheet-friendly table', Icon: FileType },
+      { id: 'excel', label: 'Excel', desc: 'Formatted .xlsx workbook', Icon: FileType },
+      { id: 'json', label: 'JSON', desc: 'Full records, every field', Icon: FileJson2 },
+      { id: 'xml', label: 'XML', desc: 'For feeds and imports', Icon: FileText },
+    ],
+  },
+  {
+    title: 'Lists',
+    items: [
+      { id: 'categories', label: 'Categories', desc: 'Unique category names', Icon: Folder },
+      { id: 'brands', label: 'Brands', desc: 'Unique brand names', Icon: Package },
+    ],
+  },
+  {
+    title: 'File archives',
+    items: [
+      { id: 'archive_all', label: 'Everything', desc: 'Data files and images', Icon: Layers },
+      { id: 'archive_data', label: 'Data only', desc: 'JSON and markdown, no images', Icon: FileText },
+      { id: 'archive_images', label: 'Images only', desc: 'Downloaded product images', Icon: ImageIcon },
+    ],
+  },
+];
+
+const DISCOVERY_LABELS = {
+  sitemap: 'Product sitemaps',
+  woocommerce_api: 'WooCommerce Store API',
+  shopify_api: 'Shopify products.json',
+  wp_rest_api: 'WordPress REST API',
+  listing_crawl: 'Listing-page crawl',
+};
+
+function Detail({ label, value, ok }) {
+  return (
+    <div className="min-w-0">
+      <p className="font-bold text-[#888ea8] uppercase tracking-wider">{label}</p>
+      <p className={`font-semibold truncate ${ok === false ? 'text-warning' : 'text-black dark:text-white'}`}>{value}</p>
+    </div>
   );
 }
 
