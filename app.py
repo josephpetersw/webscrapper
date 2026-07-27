@@ -6,11 +6,19 @@ import json
 import csv
 import io
 import logging
+import time
+import shutil
+import platform
+import threading
+from datetime import datetime, timezone
 from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
 
 app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
 CORS(app)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
@@ -20,6 +28,60 @@ MAIN_SCRIPT = os.path.join(BASE_DIR, 'main.py')
 
 # Track running scraper process
 scraper_process = None
+
+APP_START_TIME = time.time()
+
+# ── Target Site Reachability (checked in the background so status
+# requests never block on a live network call) ──────────────────
+TARGET_SITE_URL = 'https://www.phoneplacekenya.com'
+TARGET_SITE_CHECK_INTERVAL = 60  # seconds
+_target_site_lock = threading.Lock()
+_target_site_state = {'status': 'checking', 'detail': 'Awaiting first check...', 'checked_at': None}
+
+def _check_target_site_loop():
+    from curl_cffi import requests as curl_requests
+    while True:
+        try:
+            start = time.time()
+            session = curl_requests.Session(impersonate="chrome")
+            resp = session.get(TARGET_SITE_URL, timeout=10)
+            elapsed_ms = round((time.time() - start) * 1000)
+            with _target_site_lock:
+                if resp.status_code == 200:
+                    _target_site_state['status'] = 'operational'
+                    _target_site_state['detail'] = f'Responded 200 OK in {elapsed_ms}ms'
+                else:
+                    _target_site_state['status'] = 'warning'
+                    _target_site_state['detail'] = f'Responded HTTP {resp.status_code} in {elapsed_ms}ms'
+                _target_site_state['checked_at'] = datetime.now(timezone.utc).isoformat()
+        except Exception as e:
+            with _target_site_lock:
+                _target_site_state['status'] = 'down'
+                _target_site_state['detail'] = f'Unreachable: {e}'
+                _target_site_state['checked_at'] = datetime.now(timezone.utc).isoformat()
+        time.sleep(TARGET_SITE_CHECK_INTERVAL)
+
+threading.Thread(target=_check_target_site_loop, daemon=True).start()
+
+def human_size(num_bytes):
+    size = float(num_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if abs(size) < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    d, seconds = divmod(seconds, 86400)
+    h, seconds = divmod(seconds, 3600)
+    m, s = divmod(seconds, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if not parts: parts.append(f"{s}s")
+    return ' '.join(parts)
 
 # ── Memory Cache ────────────────────────────────────────────
 _CACHE = {
@@ -110,6 +172,102 @@ def get_status():
     global scraper_process
     running = scraper_process is not None and scraper_process.poll() is None
     return jsonify({'running': running, 'pid': scraper_process.pid if running else None})
+
+# ── System Status (health of every moving part in this app) ───
+@app.route('/api/system/status', methods=['GET'])
+def system_status():
+    global scraper_process
+    services = []
+
+    # 1. Backend API — if this handler runs at all, Flask is up.
+    services.append({
+        'id': 'backend_api',
+        'name': 'Backend API',
+        'category': 'Core',
+        'icon': 'server',
+        'status': 'operational',
+        'detail': f'Flask server up for {format_duration(time.time() - APP_START_TIME)}'
+    })
+
+    # 2. Scraper engine
+    running = scraper_process is not None and scraper_process.poll() is None
+    services.append({
+        'id': 'scraper_engine',
+        'name': 'Scraper Engine',
+        'category': 'Core',
+        'icon': 'cpu',
+        'status': 'active' if running else 'operational',
+        'detail': f'Running (PID {scraper_process.pid})' if running else 'Idle — ready to scrape'
+    })
+
+    # 3. Data storage
+    try:
+        exists = os.path.exists(DATA_DIR)
+        writable = exists and os.access(DATA_DIR, os.W_OK)
+        if not exists:
+            services.append({'id': 'data_storage', 'name': 'Data Storage', 'category': 'Storage', 'icon': 'database',
+                              'status': 'down', 'detail': 'Data directory missing'})
+        elif not writable:
+            services.append({'id': 'data_storage', 'name': 'Data Storage', 'category': 'Storage', 'icon': 'database',
+                              'status': 'warning', 'detail': 'Data directory is not writable'})
+        else:
+            products = load_products_from_cache()
+            services.append({'id': 'data_storage', 'name': 'Data Storage', 'category': 'Storage', 'icon': 'database',
+                              'status': 'operational', 'detail': f'{len(products):,} products indexed'})
+    except Exception as e:
+        services.append({'id': 'data_storage', 'name': 'Data Storage', 'category': 'Storage', 'icon': 'database',
+                          'status': 'down', 'detail': str(e)})
+
+    # 4. Frontend build
+    frontend_index = os.path.join(BASE_DIR, 'frontend', 'dist', 'index.html')
+    if os.path.exists(frontend_index):
+        built_at = datetime.fromtimestamp(os.path.getmtime(frontend_index)).strftime('%Y-%m-%d %H:%M')
+        services.append({'id': 'frontend_build', 'name': 'Frontend Build', 'category': 'Core', 'icon': 'layers',
+                          'status': 'operational', 'detail': f'Built {built_at}'})
+    else:
+        services.append({'id': 'frontend_build', 'name': 'Frontend Build', 'category': 'Core', 'icon': 'layers',
+                          'status': 'down', 'detail': 'No production build found — run npm run build'})
+
+    # 5. Logging
+    if os.path.exists(LOG_FILE):
+        size = os.path.getsize(LOG_FILE)
+        age = time.time() - os.path.getmtime(LOG_FILE)
+        services.append({'id': 'logging', 'name': 'Logging', 'category': 'Core', 'icon': 'file-text',
+                          'status': 'operational', 'detail': f'{human_size(size)} — last write {format_duration(age)} ago'})
+    else:
+        services.append({'id': 'logging', 'name': 'Logging', 'category': 'Core', 'icon': 'file-text',
+                          'status': 'warning', 'detail': 'No log file yet — run a scrape to generate one'})
+
+    # 6. Target site (external dependency, checked in the background)
+    with _target_site_lock:
+        ts = dict(_target_site_state)
+    services.append({'id': 'target_site', 'name': 'XphoneKenya.com', 'category': 'External', 'icon': 'globe',
+                      'status': ts['status'], 'detail': ts['detail'], 'checked_at': ts['checked_at']})
+
+    # 7. Disk space
+    try:
+        total, used, free = shutil.disk_usage(BASE_DIR)
+        pct_free = (free / total * 100) if total else 0
+        disk_status = 'operational' if pct_free > 10 else ('warning' if pct_free > 3 else 'down')
+        services.append({'id': 'disk_space', 'name': 'Disk Space', 'category': 'System', 'icon': 'hard-drive',
+                          'status': disk_status, 'detail': f'{human_size(free)} free of {human_size(total)} ({pct_free:.1f}% free)'})
+    except Exception as e:
+        services.append({'id': 'disk_space', 'name': 'Disk Space', 'category': 'System', 'icon': 'hard-drive',
+                          'status': 'down', 'detail': str(e)})
+
+    # 8. Python runtime
+    services.append({'id': 'runtime', 'name': 'Python Runtime', 'category': 'System', 'icon': 'activity',
+                      'status': 'operational', 'detail': f'Python {platform.python_version()} ({platform.system()})'})
+
+    rank = {'operational': 0, 'active': 0, 'checking': 0, 'warning': 1, 'down': 2}
+    overall_rank = max((rank.get(s['status'], 1) for s in services), default=0)
+    overall = ['operational', 'degraded', 'down'][overall_rank]
+
+    return jsonify({
+        'overall': overall,
+        'checked_at': datetime.now(timezone.utc).isoformat(),
+        'services': services
+    })
 
 # ── Logs ─────────────────────────────────────────────────────
 @app.route('/api/logs', methods=['GET'])

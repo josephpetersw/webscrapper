@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Package, Folder, Terminal, Download, StopCircle, PlayCircle, Menu, Moon, Sun, Monitor, Loader2, Image as ImageIcon, CheckCircle, ChevronRight, X, Search, ChevronLeft, Filter, LayoutGrid, List, RefreshCw, Users } from 'lucide-react';
+import { Package, Folder, Terminal, Download, StopCircle, PlayCircle, Menu, Moon, Sun, Monitor, Loader2, Image as ImageIcon, CheckCircle, ChevronRight, X, Search, ChevronLeft, Filter, LayoutGrid, List, RefreshCw, Users, Activity, Server, Database, HardDrive, Globe, Cpu, FileText, Layers, AlertTriangle, XCircle } from 'lucide-react';
 import './index.css';
 
 const API = 'http://localhost:5000';
@@ -21,6 +21,7 @@ export default function App() {
   const [allCategories, setAllCategories] = useState([]);
   const [listMode, setListMode] = useState(false);
   const [stats, setStats] = useState({ total_products: 0, total_categories: 0, total_brands: 0, total_images: 0 });
+  const [systemStatus, setSystemStatus] = useState({ overall: 'operational', checked_at: null, services: [] });
   
   const [files, setFiles] = useState([]);
   const [currentPath, setCurrentPath] = useState([]);
@@ -55,10 +56,12 @@ export default function App() {
   useEffect(() => {
     fetchFiles();
     fetchStatus();
+    fetchSystemStatus();
     const interval = setInterval(() => {
       fetchLogs();
       fetchProgress();
       fetchStatus();
+      fetchSystemStatus();
     }, 2000);
     return () => clearInterval(interval);
   }, []);
@@ -97,6 +100,14 @@ export default function App() {
       const res = await fetch(`${API}/api/stats`);
       const data = await res.json();
       setStats(data);
+    } catch {}
+  };
+
+  const fetchSystemStatus = async () => {
+    try {
+      const res = await fetch(`${API}/api/system/status`);
+      const data = await res.json();
+      setSystemStatus(data);
     } catch {}
   };
 
@@ -245,6 +256,16 @@ export default function App() {
             <span className="font-semibold">Live Logs</span>
             {scraping && <span className="ml-auto w-2 h-2 rounded-full bg-success animate-ping"></span>}
           </button>
+
+          <button onClick={() => setView('status')} className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-md transition-colors ${view === 'status' ? 'bg-primary text-white shadow-[0_10px_20px_-10px_rgba(67,97,238,0.44)]' : 'hover:bg-white-light/30 dark:hover:bg-[#1b2e4b] text-black dark:text-[#506690]'}`}>
+            <Activity className="w-5 h-5" />
+            <span className="font-semibold">System Status</span>
+            <span className={`ml-auto w-2 h-2 rounded-full ${
+              systemStatus.overall === 'operational' ? 'bg-success' :
+              systemStatus.overall === 'degraded' ? 'bg-warning animate-pulse' :
+              systemStatus.overall === 'down' ? 'bg-danger animate-ping' : 'bg-[#888ea8]'
+            }`}></span>
+          </button>
         </div>
 
         <div className="mt-auto p-4 border-t border-white-light dark:border-[#1b2e4b]">
@@ -308,6 +329,7 @@ export default function App() {
               {view === 'products' && 'Product Database'}
               {view === 'files' && 'Data Directory'}
               {view === 'logs' && 'Terminal Output'}
+              {view === 'status' && 'System Status'}
             </h1>
           </div>
 
@@ -638,6 +660,74 @@ export default function App() {
             </div>
           )}
 
+          {view === 'status' && (
+            <div className="h-full overflow-y-auto p-6">
+              {(() => {
+                const overallMeta = {
+                  operational: { label: 'All Systems Operational', color: 'success', Icon: CheckCircle },
+                  degraded: { label: 'Degraded Performance', color: 'warning', Icon: AlertTriangle },
+                  down: { label: 'System Down', color: 'danger', Icon: XCircle },
+                }[systemStatus.overall] || { label: 'Checking Systems…', color: 'secondary', Icon: Activity };
+                const OverallIcon = overallMeta.Icon;
+                const overallBoxClasses = {
+                  success: 'border-l-success bg-success/10 text-success',
+                  warning: 'border-l-warning bg-warning/10 text-warning',
+                  danger: 'border-l-danger bg-danger/10 text-danger',
+                  secondary: 'border-l-secondary bg-secondary/10 text-secondary',
+                }[overallMeta.color];
+                const [borderClass, ...iconBoxClasses] = overallBoxClasses.split(' ');
+
+                return (
+                  <div className={`panel p-6 mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-l-4 ${borderClass}`}>
+                    <div className="flex items-center gap-4">
+                      <div className={`w-14 h-14 rounded-full flex items-center justify-center flex-none ${iconBoxClasses.join(' ')}`}>
+                        <OverallIcon className="w-7 h-7" />
+                      </div>
+                      <div>
+                        <h3 className="text-xl font-bold text-black dark:text-white">{overallMeta.label}</h3>
+                        <p className="text-[#888ea8] text-sm">
+                          {systemStatus.checked_at ? `Last checked ${formatRelativeTime(systemStatus.checked_at)}` : 'Gathering status…'}
+                        </p>
+                      </div>
+                    </div>
+                    <button onClick={fetchSystemStatus} className="btn btn-outline-primary gap-2 self-start sm:self-auto">
+                      <RefreshCw className="w-4 h-4" /> Refresh
+                    </button>
+                  </div>
+                );
+              })()}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                {systemStatus.services.length === 0 ? (
+                  <div className="col-span-full py-16 text-center text-[#888ea8]">Loading service health…</div>
+                ) : systemStatus.services.map((svc) => {
+                  const Icon = STATUS_ICONS[svc.icon] || Activity;
+                  const meta = SERVICE_STATUS_META[svc.status] || SERVICE_STATUS_META.warning;
+                  return (
+                    <div key={svc.id} className="panel p-5 flex items-start gap-4">
+                      <div className={`w-11 h-11 rounded-full flex items-center justify-center flex-none ${meta.iconBox}`}>
+                        <Icon className="w-5 h-5" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-start justify-between gap-2 mb-1.5">
+                          <div>
+                            <p className="text-[10px] font-bold text-[#888ea8] uppercase tracking-wider">{svc.category}</p>
+                            <h4 className="font-bold text-black dark:text-white text-[15px] leading-tight">{svc.name}</h4>
+                          </div>
+                          <span className={`badge shrink-0 ${meta.badge}`}>{meta.label}</span>
+                        </div>
+                        <p className="text-xs text-[#888ea8] leading-relaxed break-words">{svc.detail}</p>
+                        {svc.checked_at && (
+                          <p className="text-[10px] text-[#888ea8]/70 mt-1.5">Checked {formatRelativeTime(svc.checked_at)}</p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
         </div>
       </div>
 
@@ -704,4 +794,37 @@ function sanitizeName(name) {
 
 function isImage(name) {
   return /\.(jpg|jpeg|png|webp|gif|svg)$/i.test(name);
+}
+
+const STATUS_ICONS = {
+  server: Server,
+  cpu: Cpu,
+  database: Database,
+  layers: Layers,
+  'file-text': FileText,
+  globe: Globe,
+  'hard-drive': HardDrive,
+  activity: Activity,
+};
+
+const SERVICE_STATUS_META = {
+  operational: { label: 'Operational', badge: 'badge-success', iconBox: 'bg-success/10 text-success' },
+  active: { label: 'Active', badge: 'badge-success', iconBox: 'bg-success/10 text-success' },
+  checking: { label: 'Checking…', badge: 'badge-secondary', iconBox: 'bg-secondary/10 text-secondary' },
+  warning: { label: 'Degraded', badge: 'badge-warning', iconBox: 'bg-warning/10 text-warning' },
+  down: { label: 'Down', badge: 'badge-danger', iconBox: 'bg-danger/10 text-danger' },
+};
+
+function formatRelativeTime(isoString) {
+  if (!isoString) return 'just now';
+  const diffMs = Date.now() - new Date(isoString).getTime();
+  const seconds = Math.max(0, Math.round(diffMs / 1000));
+  if (seconds < 5) return 'just now';
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
 }
