@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { Package, Folder, Terminal, Download, StopCircle, PlayCircle, Menu, Moon, Sun, Monitor, Loader2, Image as ImageIcon, CheckCircle, ChevronRight, X, Search, ChevronLeft, Filter, LayoutGrid, List, RefreshCw, Users, Activity, Server, Database, HardDrive, Globe, Cpu, FileText, Layers, AlertTriangle, XCircle } from 'lucide-react';
+import { Package, Folder, Terminal, Download, StopCircle, PlayCircle, Menu, Moon, Sun, Monitor, Loader2, Image as ImageIcon, CheckCircle, ChevronRight, X, Search, ChevronLeft, Filter, LayoutGrid, List, RefreshCw, Users, Activity, Server, Database, HardDrive, Globe, Cpu, FileText, Layers, AlertTriangle, XCircle, ExternalLink, FileJson2, FileType } from 'lucide-react';
+import { marked } from 'marked';
 import './index.css';
 
 const API = 'http://localhost:5000';
@@ -11,6 +12,10 @@ export default function App() {
   const [progress, setProgress] = useState({ current: 0, total: 0, eta: 0 });
   const [products, setProducts] = useState([]);
   const [selectedProduct, setSelectedProduct] = useState(null);
+  const [previewFile, setPreviewFile] = useState(null);
+  const [previewContent, setPreviewContent] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState(null);
   
   const [view, setView] = useState('products');
   const [page, setPage] = useState(1);
@@ -201,8 +206,31 @@ export default function App() {
       setCurrentPath(newPath);
       fetchFiles(node.path);
     } else {
-      window.open(`${API}/data/${node.path}`, '_blank');
+      openPreview(node);
     }
+  };
+
+  const openPreview = async (node) => {
+    setPreviewFile(node);
+    setPreviewContent(null);
+    setPreviewError(null);
+    const kind = getFileKind(node.name);
+    if (kind === 'image') return;
+    setPreviewLoading(true);
+    try {
+      const res = await fetch(`${API}/data/${node.path}`);
+      if (!res.ok) throw new Error(`Failed to load file (HTTP ${res.status})`);
+      setPreviewContent(await res.text());
+    } catch (e) {
+      setPreviewError(e.message || 'Failed to load file');
+    }
+    setPreviewLoading(false);
+  };
+
+  const closePreview = () => {
+    setPreviewFile(null);
+    setPreviewContent(null);
+    setPreviewError(null);
   };
 
   const navigateUp = () => {
@@ -612,18 +640,25 @@ export default function App() {
                       <span className="font-semibold text-black dark:text-white">.. Go Up</span>
                     </div>
                   )}
-                  {files.map((f, i) => (
-                    <div key={i} onClick={() => navigateTo(f)} className="border border-white-light dark:border-[#1b2e4b] rounded-md p-4 cursor-pointer hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b] transition-colors flex flex-col items-center gap-2 text-center relative h-32">
-                      {f.type === 'directory' ? (
-                        <Folder className="w-10 h-10 text-warning mb-1" />
-                      ) : isImage(f.name) ? (
-                        <img src={`${API}/data/${f.path}`} className="w-full h-16 object-cover rounded mb-1" alt={f.name} onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'block'; }} />
-                      ) : (
-                        <div className="w-10 h-10 bg-primary/10 rounded flex items-center justify-center text-primary font-bold text-xs mb-1">JSON</div>
-                      )}
-                      <span className="text-xs font-semibold text-black dark:text-white line-clamp-2 w-full break-all leading-tight mt-auto">{f.name}</span>
-                    </div>
-                  ))}
+                  {files.map((f, i) => {
+                    const kind = f.type === 'directory' ? null : getFileKind(f.name);
+                    const meta = kind ? FILE_KIND_META[kind] : null;
+                    const KindIcon = meta?.Icon;
+                    return (
+                      <div key={i} onClick={() => navigateTo(f)} className="border border-white-light dark:border-[#1b2e4b] rounded-md p-4 cursor-pointer hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b] transition-colors flex flex-col items-center gap-2 text-center relative h-32">
+                        {f.type === 'directory' ? (
+                          <Folder className="w-10 h-10 text-warning mb-1" />
+                        ) : kind === 'image' ? (
+                          <img src={`${API}/data/${f.path}`} className="w-full h-16 object-cover rounded mb-1" alt={f.name} onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'block'; }} />
+                        ) : (
+                          <div className={`w-10 h-10 rounded flex items-center justify-center mb-1 ${meta.iconBox}`}>
+                            <KindIcon className="w-5 h-5" />
+                          </div>
+                        )}
+                        <span className="text-xs font-semibold text-black dark:text-white line-clamp-2 w-full break-all leading-tight mt-auto">{f.name}</span>
+                      </div>
+                    );
+                  })}
                   {files.length === 0 && currentPath.length === 0 && (
                     <div className="col-span-full py-10 text-center text-[#888ea8]">No files found.</div>
                   )}
@@ -784,6 +819,96 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* File Preview Modal */}
+      {previewFile && (() => {
+        const kind = getFileKind(previewFile.name);
+        const meta = FILE_KIND_META[kind];
+        const PreviewIcon = meta.Icon;
+        const rawUrl = `${API}/data/${previewFile.path}`;
+        return (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6" onClick={closePreview}>
+            <div className="bg-white dark:bg-[#0e1726] rounded-lg shadow-xl w-full max-w-4xl max-h-full flex flex-col overflow-hidden animate-[scaleIn_0.2s_ease-out]" onClick={(e) => e.stopPropagation()}>
+
+              <div className="flex items-center justify-between px-6 py-4 border-b border-white-light dark:border-[#1b2e4b] gap-4">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className={`w-9 h-9 rounded-md flex items-center justify-center flex-none ${meta.iconBox}`}>
+                    <PreviewIcon className="w-4 h-4" />
+                  </div>
+                  <h3 className="text-lg font-bold text-black dark:text-white truncate">{previewFile.name}</h3>
+                </div>
+                <div className="flex items-center gap-2 flex-none">
+                  <a href={rawUrl} target="_blank" rel="noreferrer" className="btn btn-outline-primary gap-2 py-1.5 px-3 text-xs">
+                    <ExternalLink className="w-3.5 h-3.5" /> Open in New Tab
+                  </a>
+                  <button onClick={closePreview} className="p-1.5 rounded-md hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b] text-[#888ea8]">
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="overflow-y-auto p-6 flex-1">
+                {kind === 'image' && (
+                  <img src={rawUrl} alt={previewFile.name} className="max-h-[70vh] w-full object-contain rounded-md mx-auto" />
+                )}
+
+                {kind !== 'image' && previewLoading && (
+                  <div className="py-20 flex flex-col items-center justify-center text-[#888ea8] gap-3">
+                    <Loader2 className="w-8 h-8 animate-spin" />
+                    Loading file…
+                  </div>
+                )}
+
+                {kind !== 'image' && !previewLoading && previewError && (
+                  <div className="py-20 flex flex-col items-center justify-center text-center gap-2">
+                    <AlertTriangle className="w-8 h-8 text-warning" />
+                    <p className="text-black dark:text-white font-semibold">Couldn't load this file</p>
+                    <p className="text-[#888ea8] text-sm">{previewError}</p>
+                  </div>
+                )}
+
+                {kind === 'json' && !previewLoading && !previewError && previewContent !== null && (
+                  (() => {
+                    let pretty = previewContent;
+                    let parseError = null;
+                    try { pretty = JSON.stringify(JSON.parse(previewContent), null, 2); } catch (e) { parseError = e.message; }
+                    return (
+                      <>
+                        {parseError && (
+                          <p className="text-warning text-xs mb-2">Not valid JSON ({parseError}) — showing raw contents.</p>
+                        )}
+                        <pre
+                          className="terminal p-4 text-xs whitespace-pre-wrap break-all max-h-[65vh] overflow-auto"
+                          dangerouslySetInnerHTML={{ __html: highlightJson(pretty) }}
+                        />
+                      </>
+                    );
+                  })()
+                )}
+
+                {kind === 'markdown' && !previewLoading && !previewError && previewContent !== null && (
+                  <div
+                    className="markdown-body text-[15px] leading-relaxed text-black dark:text-[#c5d0e6]"
+                    dangerouslySetInnerHTML={{ __html: marked.parse(previewContent) }}
+                  />
+                )}
+
+                {kind === 'text' && !previewLoading && !previewError && previewContent !== null && (
+                  <pre className="terminal p-4 text-xs whitespace-pre-wrap break-all max-h-[65vh] overflow-auto">{previewContent}</pre>
+                )}
+
+                {kind === 'unsupported' && !previewLoading && !previewError && (
+                  <div className="py-20 flex flex-col items-center justify-center text-center gap-2">
+                    <FileType className="w-10 h-10 text-[#888ea8] opacity-50" />
+                    <p className="text-black dark:text-white font-semibold">No inline preview for this file type</p>
+                    <p className="text-[#888ea8] text-sm">Use "Open in New Tab" above to view or download it.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -792,8 +917,43 @@ function sanitizeName(name) {
   return (name || '').replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
 }
 
-function isImage(name) {
-  return /\.(jpg|jpeg|png|webp|gif|svg)$/i.test(name);
+const FILE_KIND_META = {
+  image: { Icon: ImageIcon, iconBox: 'bg-warning/10 text-warning' },
+  json: { Icon: FileJson2, iconBox: 'bg-primary/10 text-primary' },
+  markdown: { Icon: FileText, iconBox: 'bg-secondary/10 text-secondary' },
+  text: { Icon: FileType, iconBox: 'bg-[#888ea8]/10 text-[#888ea8]' },
+  unsupported: { Icon: FileType, iconBox: 'bg-[#888ea8]/10 text-[#888ea8]' },
+};
+
+function getFileKind(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg', 'bmp', 'avif', 'ico'].includes(ext)) return 'image';
+  if (ext === 'json') return 'json';
+  if (ext === 'md' || ext === 'markdown') return 'markdown';
+  if (['txt', 'log', 'csv', 'xml'].includes(ext)) return 'text';
+  return 'unsupported';
+}
+
+function escapeHtml(str) {
+  return str.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function highlightJson(json) {
+  const escaped = escapeHtml(json);
+  return escaped.replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g,
+    (match) => {
+      let cls = 'text-warning';
+      if (match.startsWith('"')) {
+        cls = match.endsWith(':') ? 'text-primary font-semibold' : 'text-success';
+      } else if (match === 'true' || match === 'false') {
+        cls = 'text-secondary font-semibold';
+      } else if (match === 'null') {
+        cls = 'text-danger font-semibold';
+      }
+      return `<span class="${cls}">${match}</span>`;
+    }
+  );
 }
 
 const STATUS_ICONS = {
