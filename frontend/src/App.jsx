@@ -262,6 +262,33 @@ export default function App() {
     setExportJob(null);
   };
 
+  const cancelExportJob = async () => {
+    if (!exportJob?.jobId) return;
+    setExportJob({ ...exportJob, cancelling: true, message: 'Cancelling…' });
+    try {
+      await fetch(`${API}/api/export/cancel/${exportJob.jobId}`, { method: 'POST' });
+    } catch {
+      // The poll below still reflects whatever the server ends up doing.
+    }
+  };
+
+  const closeExportJob = async () => {
+    clearInterval(exportPollRef.current);
+    setExportJob(null);
+    // A cancelled export leaves a partial file behind that the server deletes;
+    // refresh so the dashboard reflects the cleaned-up state.
+    await Promise.all([fetchSites(), fetchFiles(), fetchSystemStatus()]);
+  };
+
+  // Once the server confirms a cancel, close out and refresh.
+  useEffect(() => {
+    if (exportJob?.state === 'cancelled') {
+      clearInterval(exportPollRef.current);
+      const timer = setTimeout(() => { closeExportJob(); }, 900);
+      return () => clearTimeout(timer);
+    }
+  }, [exportJob?.state]);
+
   const handleExport = async (type, endpoint) => {
     setExporting(type);
     try {
@@ -1098,6 +1125,8 @@ export default function App() {
       {exportJob && (() => {
         const done = exportJob.state === 'ready';
         const failed = exportJob.state === 'error';
+        const cancelled = exportJob.state === 'cancelled';
+        const settled = done || failed || cancelled;
         const pct = exportJob.total_steps
           ? Math.min(100, Math.round(((exportJob.step || 0) / exportJob.total_steps) * 100)) : 0;
         return (
@@ -1105,18 +1134,29 @@ export default function App() {
             <div className="bg-white dark:bg-[#0e1726] rounded-lg shadow-xl w-full max-w-md flex flex-col overflow-hidden animate-[scaleIn_0.2s_ease-out]">
               <div className="flex items-center gap-3 px-6 py-4 border-b border-white-light dark:border-[#1b2e4b]">
                 <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-none ${
-                  failed ? 'bg-danger/10 text-danger' : done ? 'bg-success/10 text-success' : 'bg-primary/10 text-primary'}`}>
+                  failed ? 'bg-danger/10 text-danger'
+                    : cancelled ? 'bg-[#888ea8]/10 text-[#888ea8]'
+                    : done ? 'bg-success/10 text-success' : 'bg-primary/10 text-primary'}`}>
                   {failed ? <XCircle className="w-5 h-5" />
+                    : cancelled ? <StopCircle className="w-5 h-5" />
                     : done ? <CheckCircle className="w-5 h-5" />
                     : <Loader2 className="w-5 h-5 animate-spin" />}
                 </div>
                 <h3 className="text-lg font-bold text-black dark:text-white">
-                  {failed ? 'Export failed' : done ? 'Export ready' : 'Preparing export'}
+                  {failed ? 'Export failed'
+                    : cancelled ? 'Export cancelled'
+                    : done ? 'Export ready' : 'Preparing export'}
                 </h3>
               </div>
 
               <div className="p-6 space-y-4">
-                {!failed && (
+                {cancelled && (
+                  <p className="text-sm text-[#888ea8] leading-relaxed">
+                    The export was stopped and the partial file discarded. Nothing was downloaded.
+                  </p>
+                )}
+
+                {!failed && !cancelled && (
                   <>
                     <div>
                       <div className="flex justify-between items-baseline mb-2">
@@ -1145,18 +1185,24 @@ export default function App() {
 
                 {failed && <p className="text-sm text-danger break-words">{exportJob.error || exportJob.message}</p>}
 
-                {!done && !failed && (
+                {!settled && (
                   <p className="text-xs text-[#888ea8] leading-relaxed">
-                    Large exports with images can take a few minutes. You can leave this open —
-                    the work continues on the server.
+                    Large exports with images can take a few minutes. Hide this to keep working —
+                    the export continues on the server — or cancel it to stop and discard it.
                   </p>
                 )}
               </div>
 
               <div className="flex justify-end gap-2 px-6 py-4 border-t border-white-light dark:border-[#1b2e4b]">
-                <button onClick={() => { clearInterval(exportPollRef.current); setExportJob(null); }}
-                  className="btn btn-outline-secondary">
-                  {done || failed ? 'Close' : 'Hide'}
+                {!settled && (
+                  <button onClick={cancelExportJob} disabled={exportJob.cancelling}
+                    className="btn btn-outline-danger gap-2 mr-auto disabled:opacity-50">
+                    <StopCircle className="w-4 h-4" />
+                    {exportJob.cancelling ? 'Cancelling…' : 'Cancel export'}
+                  </button>
+                )}
+                <button onClick={closeExportJob} className="btn btn-outline-secondary">
+                  {settled ? 'Close' : 'Hide'}
                 </button>
                 {done && (
                   <button onClick={downloadExportJob} className="btn btn-primary gap-2">

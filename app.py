@@ -969,7 +969,11 @@ ARCHIVE_FORMATS = {
     'archive_images': ('images-only', lambda name: name == 'images'),
 }
 
-def add_structured_to_zip(zipf, site, fmt, prefix, on_progress=None):
+class ExportCancelled(Exception):
+    """Raised inside a running export job once the user asks to cancel."""
+
+
+def add_structured_to_zip(zipf, site, fmt, prefix, on_progress=None, should_cancel=None):
     structured = os.path.join(DATA_DIR, site, 'structured')
     if not os.path.isdir(structured):
         return 0
@@ -987,10 +991,16 @@ def add_structured_to_zip(zipf, site, fmt, prefix, on_progress=None):
             try:
                 zipf.write(full, arc)
                 written += 1
-                # Archives can run to thousands of files; report periodically
-                # so the UI keeps moving instead of appearing to hang.
-                if on_progress and written % 50 == 0:
-                    on_progress(written)
+                # Archives can run to thousands of files; report progress and
+                # check for cancellation periodically so the UI keeps moving
+                # and a cancel doesn't wait for the whole archive to finish.
+                if written % 50 == 0:
+                    if should_cancel and should_cancel():
+                        raise ExportCancelled()
+                    if on_progress:
+                        on_progress(written)
+            except ExportCancelled:
+                raise
             except Exception as e:
                 logger.error(f"Skipping {full} in archive: {e}")
     if on_progress:
@@ -1032,13 +1042,23 @@ def _purge_old_export_jobs():
                     pass
             del _export_jobs[jid]
 
+def _job_cancelled(job_id):
+    with _export_jobs_lock:
+        return bool(_export_jobs.get(job_id, {}).get('cancel_requested'))
+
+
 def _run_export_job(job_id, sites, formats, clean):
     suffix = '' if clean else 'raw_'
     steps = [(site, fmt) for site in sites for fmt in formats]
     _job_update(job_id, state='running', total_steps=len(steps), step=0,
                 message='Preparing…')
 
+    path = None
     try:
+        def check_cancelled():
+            if _job_cancelled(job_id):
+                raise ExportCancelled()
+
         products_cache = {}
 
         def products_for(site):
@@ -1053,7 +1073,9 @@ def _run_export_job(job_id, sites, formats, clean):
             site, fmt = sites[0], formats[0]
             filename, builder = EXPORT_BUILDERS[fmt]
             _job_update(job_id, step=0, message=f'Building {FORMAT_LABELS.get(fmt, fmt)} for {site}…')
+            check_cancelled()
             payload = builder(products_for(site), clean)
+            check_cancelled()
             path = os.path.join(export_workspace(), f'{job_id}_{filename}')
             with open(path, 'wb') as f:
                 f.write(payload)
@@ -1065,6 +1087,7 @@ def _run_export_job(job_id, sites, formats, clean):
         path = os.path.join(export_workspace(), f'{job_id}.zip')
         with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for index, (site, fmt) in enumerate(steps, start=1):
+                check_cancelled()
                 label = FORMAT_LABELS.get(fmt, fmt)
                 _job_update(job_id, step=index - 1,
                             message=f'Building {label} for {site}…')
@@ -1083,7 +1106,10 @@ def _run_export_job(job_id, sites, formats, clean):
 
                         add_structured_to_zip(zipf, site, fmt,
                                               os.path.join(folder, archive_label),
-                                              on_progress=progress)
+                                              on_progress=progress,
+                                              should_cancel=lambda: _job_cancelled(job_id))
+                except ExportCancelled:
+                    raise
                 except Exception as e:
                     # One bad format must not cost the rest of the bundle.
                     logger.error(f"Export {fmt} for {site} failed: {e}")
@@ -1096,9 +1122,23 @@ def _run_export_job(job_id, sites, formats, clean):
                 else f"export_{len(sites)}_sites_{stamp}.zip")
         _job_update(job_id, state='ready', path=path, filename=name,
                     size=os.path.getsize(path), message='Ready to download')
+    except ExportCancelled:
+        # Drop the half-built archive rather than leaving hundreds of MB behind.
+        _discard_export_file(path)
+        logger.info(f"Export job {job_id} cancelled by user")
+        _job_update(job_id, state='cancelled', path=None, message='Export cancelled')
     except Exception as e:
+        _discard_export_file(path)
         logger.error(f"Export job {job_id} failed: {e}")
-        _job_update(job_id, state='error', error=str(e), message='Export failed')
+        _job_update(job_id, state='error', path=None, error=str(e), message='Export failed')
+
+
+def _discard_export_file(path):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception as e:
+            logger.error(f"Could not remove partial export {path}: {e}")
 
 @app.route('/api/export/start', methods=['POST'])
 def start_export():
@@ -1133,6 +1173,25 @@ def export_status(job_id):
         if not job:
             return jsonify({'error': 'Unknown or expired export job'}), 404
         return jsonify({k: v for k, v in job.items() if k != 'path'})
+
+@app.route('/api/export/cancel/<job_id>', methods=['POST'])
+def cancel_export(job_id):
+    """Ask a running export to stop.
+
+    The worker checks this flag between steps and every 50 files while packing
+    an archive, so a cancel takes effect quickly rather than waiting for a
+    multi-thousand-file archive to finish.
+    """
+    with _export_jobs_lock:
+        job = _export_jobs.get(job_id)
+        if not job:
+            return jsonify({'status': 'error', 'message': 'Unknown or expired export job'}), 404
+        if job['state'] in ('ready', 'error', 'cancelled'):
+            return jsonify({'status': 'success', 'state': job['state'],
+                            'message': 'Export already finished'})
+        job['cancel_requested'] = True
+        job['message'] = 'Cancelling…'
+    return jsonify({'status': 'success', 'state': 'cancelling'})
 
 @app.route('/api/export/download/<job_id>', methods=['GET'])
 def export_download(job_id):
