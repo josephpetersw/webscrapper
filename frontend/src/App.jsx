@@ -27,7 +27,6 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [scraping, setScraping] = useState(false);
   const [exporting, setExporting] = useState(null);
-  const [exportClean, setExportClean] = useState(true);
   const [isDark, setIsDark] = useState(() => {
     if (typeof window !== 'undefined') {
       return localStorage.getItem('theme') === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -104,8 +103,7 @@ export default function App() {
   const handleExport = async (type, endpoint) => {
     setExporting(type);
     try {
-      const exportEndpoint = endpoint.includes('?') ? `${endpoint}&clean=${exportClean}` : `${endpoint}?clean=${exportClean}`;
-      const res = await fetch(`${API}${exportEndpoint}`);
+      const res = await fetch(`${API}${endpoint}`);
       const blob = await res.blob();
       
       const disposition = res.headers.get('Content-Disposition');
@@ -250,22 +248,37 @@ export default function App() {
         </div>
 
         <div className="mt-auto p-4 border-t border-white-light dark:border-[#1b2e4b]">
-            <div className="flex items-center gap-2 mb-3 px-1 text-sm font-medium text-black dark:text-[#888ea8]">
-              <input type="checkbox" id="cleanHtml" checked={exportClean} onChange={(e) => setExportClean(e.target.checked)} className="form-checkbox text-primary rounded bg-white dark:bg-[#1b2e4b] border-white-light dark:border-[#1b2e4b] w-4 h-4 cursor-pointer" />
-              <label htmlFor="cleanHtml" className="cursor-pointer mb-0">Clean HTML from exports</label>
-            </div>
             <div className="flex flex-col gap-2 mb-4">
               <button onClick={() => handleExport('json', '/api/export/json')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
                 {exporting === 'json' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export JSON
               </button>
-              <button onClick={() => handleExport('csv', '/api/export/csv')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'csv' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export CSV
+              
+              <button onClick={() => handleExport('csv_clean', '/api/export/csv?clean=true')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'csv_clean' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export CSV (Clean)
               </button>
-              <button onClick={() => handleExport('excel', '/api/export/excel')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
-                {exporting === 'excel' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Excel
+              <button onClick={() => handleExport('csv_raw', '/api/export/csv?clean=false')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'csv_raw' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export CSV (Raw HTML)
               </button>
+              
+              <button onClick={() => handleExport('excel_clean', '/api/export/excel?clean=true')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'excel_clean' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Excel (Clean)
+              </button>
+              <button onClick={() => handleExport('excel_raw', '/api/export/excel?clean=false')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'excel_raw' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Excel (Raw HTML)
+              </button>
+
               <button onClick={() => handleExport('xml', '/api/export/xml')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
                 {exporting === 'xml' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export XML
+              </button>
+           </div>
+           
+           <div className="flex flex-col gap-2 mb-4">
+              <p className="text-xs font-bold text-[#888ea8] uppercase tracking-wider mb-1">Data Lists</p>
+              <button onClick={() => handleExport('categories_csv', '/api/export/categories_csv')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'categories_csv' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Categories
+              </button>
+              <button onClick={() => handleExport('brands_csv', '/api/export/brands_csv')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'brands_csv' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Brands
               </button>
            </div>
            

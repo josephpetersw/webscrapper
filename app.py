@@ -498,6 +498,64 @@ def export_categories():
         return jsonify({'error': 'No categories to export'}), 404
     return send_from_directory(DATA_DIR, 'categories.json', as_attachment=True, download_name='categories.json')
 
+@app.route('/api/export/categories_csv', methods=['GET'])
+def export_categories_csv():
+    products_file = os.path.join(DATA_DIR, 'products.json')
+    if not os.path.exists(products_file):
+        return jsonify({'error': 'No data to export'}), 404
+    try:
+        with open(products_file, 'r', encoding='utf-8') as f:
+            products = json.load(f)
+            
+        categories = set()
+        for p in products:
+            for cat in p.get('categories', []):
+                if cat: categories.add(cat.strip())
+                
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['Category Name'])
+        for cat in sorted(list(categories)):
+            writer.writerow([cat])
+            
+        output.seek(0)
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition': 'attachment; filename=phoneplacekenya_categories.csv'}
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/export/brands_csv', methods=['GET'])
+def export_brands_csv():
+    products_file = os.path.join(DATA_DIR, 'products.json')
+    if not os.path.exists(products_file):
+        return jsonify({'error': 'No data to export'}), 404
+    try:
+        with open(products_file, 'r', encoding='utf-8') as f:
+            products = json.load(f)
+            
+        brands = set()
+        for p in products:
+            b = p.get('brand')
+            if b: brands.add(b.strip())
+                
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['Brand Name'])
+        for b in sorted(list(brands)):
+            writer.writerow([b])
+            
+        output.seek(0)
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition': 'attachment; filename=phoneplacekenya_brands.csv'}
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     os.makedirs(DATA_DIR, exist_ok=True)
     app.run(host='0.0.0.0', port=5000, debug=False)
