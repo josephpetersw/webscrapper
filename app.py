@@ -1,4 +1,5 @@
 import os
+import re
 import signal
 import subprocess
 import json
@@ -264,23 +265,70 @@ def export_json():
     products_file = os.path.join(DATA_DIR, 'products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
-    return send_from_directory(DATA_DIR, 'products.json', as_attachment=True, download_name='phoneplacekenya_products.json')
+        
+    is_clean = request.args.get('clean', 'true').lower() in ('true', '1')
+    
+    if not is_clean:
+        return send_from_directory(DATA_DIR, 'products.json', as_attachment=True, download_name='phoneplacekenya_products.json')
+        
+    try:
+        with open(products_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for item in data:
+            if 'short_description' in item:
+                item['short_description'] = clean_html(item['short_description'])
+            if 'long_description' in item:
+                item['long_description'] = clean_html(item['long_description'])
+        
+        output = io.BytesIO()
+        output.write(json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8'))
+        output.seek(0)
+        return Response(
+            output.getvalue(),
+            mimetype='application/json',
+            headers={'Content-Disposition': 'attachment; filename=phoneplacekenya_products.json'}
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def clean_html(raw_html):
+    if not raw_html: return ""
+    text = re.sub(r'<(br|/p|/li|div[^>]*)>', '\n', raw_html, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    import html
+    text = html.unescape(text)
+    text = re.sub(r'\n\s*\n', '\n', text).strip()
+    return text
 
 @app.route('/api/export/csv', methods=['GET'])
 def export_csv():
     products_file = os.path.join(DATA_DIR, 'products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
+        
+    is_clean = request.args.get('clean', 'true').lower() in ('true', '1')
+    
     try:
         with open(products_file, 'r', encoding='utf-8') as f:
             products = json.load(f)
         output = io.StringIO()
-        fieldnames = ['title', 'brand', 'price', 'url', 'categories', 'images', 'short_description']
+        fieldnames = ['title', 'brand', 'price', 'url', 'categories', 'images', 'short_description', 'long_description']
         writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         for p in products:
             if not p.get('title'):
                 continue
+                
+            short_desc = p.get('short_description', '') or ''
+            long_desc = p.get('long_description', '') or ''
+            
+            if is_clean:
+                short_desc = clean_html(short_desc)
+                long_desc = clean_html(long_desc)
+            else:
+                short_desc = short_desc.replace('<br>', '\n')
+                long_desc = long_desc.replace('<br>', '\n')
+                
             row = {
                 'title': p.get('title', ''),
                 'brand': p.get('brand', ''),
@@ -288,7 +336,8 @@ def export_csv():
                 'url': p.get('url', ''),
                 'categories': ' > '.join(p.get('categories', [])),
                 'images': ' | '.join(p.get('images', [])),
-                'short_description': (p.get('short_description', '') or '').replace('<br>', '\n')
+                'short_description': short_desc,
+                'long_description': long_desc
             }
             writer.writerow(row)
         output.seek(0)
@@ -305,6 +354,9 @@ def export_excel():
     products_file = os.path.join(DATA_DIR, 'products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
+        
+    is_clean = request.args.get('clean', 'true').lower() in ('true', '1')
+    
     try:
         import pandas as pd
         with open(products_file, 'r', encoding='utf-8') as f:
@@ -313,14 +365,26 @@ def export_excel():
         data = []
         for p in products:
             if not p.get('title'): continue
+            
+            short_desc = p.get('short_description', '') or ''
+            long_desc = p.get('long_description', '') or ''
+            
+            if is_clean:
+                short_desc = clean_html(short_desc)
+                long_desc = clean_html(long_desc)
+            else:
+                short_desc = short_desc.replace('<br>', '\n')
+                long_desc = long_desc.replace('<br>', '\n')
+                
             data.append({
-                'Title': p.get('title', ''),
-                'Brand': p.get('brand', ''),
-                'Price': p.get('price', ''),
-                'URL': p.get('url', ''),
-                'Categories': ' > '.join(p.get('categories', [])),
-                'Images': ' | '.join(p.get('images', [])),
-                'Short Description': (p.get('short_description', '') or '').replace('<br>', '\n')
+                'Title': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', p.get('title', '')),
+                'Brand': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', p.get('brand', '')),
+                'Price': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', p.get('price', '')),
+                'URL': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', p.get('url', '')),
+                'Categories': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', ' > '.join(p.get('categories', []))),
+                'Images': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', ' | '.join(p.get('images', []))),
+                'Short Description': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', short_desc),
+                'Long Description': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', long_desc)
             })
             
         df = pd.DataFrame(data)
@@ -335,6 +399,9 @@ def export_xml():
     products_file = os.path.join(DATA_DIR, 'products.json')
     if not os.path.exists(products_file):
         return jsonify({'error': 'No data to export'}), 404
+        
+    is_clean = request.args.get('clean', 'true').lower() in ('true', '1')
+    
     try:
         with open(products_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -344,6 +411,13 @@ def export_xml():
             for item in data:
                 if not item.get('title'): continue
                 f.write('  <product>\n')
+                
+                if is_clean:
+                    if 'short_description' in item:
+                        item['short_description'] = clean_html(item['short_description'])
+                    if 'long_description' in item:
+                        item['long_description'] = clean_html(item['long_description'])
+                        
                 for k, v in item.items():
                     if isinstance(v, list):
                         v = ', '.join([str(i).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;') for i in v])

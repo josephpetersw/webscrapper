@@ -68,6 +68,6 @@
   }
 
   .terminal {
-    @apply bg-[#0e1726] text-[#00ab55] font-mono text-[13px] leading-relaxed rounded-md overflow-y-auto;
+    @apply bg-[#f4f4f4] dark:bg-[#0e1726] text-[#333] dark:text-[#00ab55] font-mono text-[13px] leading-relaxed rounded-md overflow-y-auto border border-white-light dark:border-[#1b2e4b];
   }
 }

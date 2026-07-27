@@ -26,6 +26,8 @@ export default function App() {
   const [currentPath, setCurrentPath] = useState([]);
   const [loading, setLoading] = useState(false);
   const [scraping, setScraping] = useState(false);
+  const [exporting, setExporting] = useState(null);
+  const [exportClean, setExportClean] = useState(true);
   const [isDark, setIsDark] = useState(() => {
     if (typeof window !== 'undefined') {
       return localStorage.getItem('theme') === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -91,6 +93,47 @@ export default function App() {
     } catch {}
   };
 
+  const fetchStats = async () => {
+    try {
+      const res = await fetch(`${API}/api/stats`);
+      const data = await res.json();
+      setStats(data);
+    } catch {}
+  };
+
+  const handleExport = async (type, endpoint) => {
+    setExporting(type);
+    try {
+      const exportEndpoint = endpoint.includes('?') ? `${endpoint}&clean=${exportClean}` : `${endpoint}?clean=${exportClean}`;
+      const res = await fetch(`${API}${exportEndpoint}`);
+      const blob = await res.blob();
+      
+      const disposition = res.headers.get('Content-Disposition');
+      let filename = `export_${type}`;
+      if (disposition && disposition.indexOf('filename=') !== -1) {
+        filename = disposition.split('filename=')[1].replace(/["']/g, '');
+      } else {
+        if (endpoint.endsWith('json')) filename += '.json';
+        else if (endpoint.endsWith('csv')) filename += '.csv';
+        else if (endpoint.endsWith('excel')) filename += '.xlsx';
+        else if (endpoint.endsWith('xml')) filename += '.xml';
+        else filename += '.zip';
+      }
+
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (e) {
+      console.error('Export failed', e);
+    }
+    setExporting(null);
+  };
+
   const fetchProducts = async () => {
     try {
       const res = await fetch(`${API}/api/products?page=${page}&limit=${limit}&search=${encodeURIComponent(search)}&category=${encodeURIComponent(category)}`);
@@ -100,16 +143,6 @@ export default function App() {
       if (data.categories) setAllCategories(data.categories);
     } catch (e) {
       console.error('Failed to fetch products', e);
-    }
-  };
-
-  const fetchStats = async () => {
-    try {
-      const res = await fetch(`${API}/api/stats`);
-      const data = await res.json();
-      setStats(data);
-    } catch (e) {
-      console.error('Failed to fetch stats', e);
     }
   };
 
@@ -192,7 +225,6 @@ export default function App() {
   return (
     <div className="flex h-screen overflow-hidden bg-[#fafafa] dark:bg-[#060818] font-sans text-sm text-[#888ea8]">
       
-      {/* Sidebar */}
       <aside className={`flex-none bg-white dark:bg-[#0e1726] border-r border-white-light dark:border-[#1b2e4b] transition-all duration-300 ${sidebarOpen ? 'w-[260px]' : 'w-0 overflow-hidden'}`}>
         <div className="flex items-center px-6 py-5 border-b border-white-light dark:border-[#1b2e4b]">
           <Monitor className="w-6 h-6 text-primary mr-2" />
@@ -218,40 +250,42 @@ export default function App() {
         </div>
 
         <div className="mt-auto p-4 border-t border-white-light dark:border-[#1b2e4b]">
+            <div className="flex items-center gap-2 mb-3 px-1 text-sm font-medium text-black dark:text-[#888ea8]">
+              <input type="checkbox" id="cleanHtml" checked={exportClean} onChange={(e) => setExportClean(e.target.checked)} className="form-checkbox text-primary rounded bg-white dark:bg-[#1b2e4b] border-white-light dark:border-[#1b2e4b] w-4 h-4 cursor-pointer" />
+              <label htmlFor="cleanHtml" className="cursor-pointer mb-0">Clean HTML from exports</label>
+            </div>
             <div className="flex flex-col gap-2 mb-4">
-              <a href={`${API}/api/export/json`} download className="btn btn-outline-primary w-full gap-2">
-                <Download className="w-4 h-4" /> Export JSON
-              </a>
-              <a href={`${API}/api/export/csv`} download className="btn btn-outline-primary w-full gap-2">
-                <Download className="w-4 h-4" /> Export CSV
-              </a>
-              <a href={`${API}/api/export/excel`} download className="btn btn-outline-primary w-full gap-2">
-                <Download className="w-4 h-4" /> Export Excel
-              </a>
-              <a href={`${API}/api/export/xml`} download className="btn btn-outline-primary w-full gap-2 text-left">
-                <Download className="w-4 h-4" /> Export XML
-              </a>
+              <button onClick={() => handleExport('json', '/api/export/json')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'json' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export JSON
+              </button>
+              <button onClick={() => handleExport('csv', '/api/export/csv')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'csv' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export CSV
+              </button>
+              <button onClick={() => handleExport('excel', '/api/export/excel')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'excel' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Excel
+              </button>
+              <button onClick={() => handleExport('xml', '/api/export/xml')} disabled={exporting !== null} className="btn btn-outline-primary w-full gap-2 text-left justify-center">
+                {exporting === 'xml' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export XML
+              </button>
            </div>
            
            <div className="flex flex-col gap-2">
               <p className="text-xs font-bold text-[#888ea8] uppercase tracking-wider mb-1">ZIP Archives</p>
-              <a href={`${API}/api/export/structured`} download className="btn btn-outline-secondary w-full gap-2">
-                <Download className="w-4 h-4" /> Export Everything
-              </a>
-              <a href={`${API}/api/export/structured/data`} download className="btn btn-outline-secondary w-full gap-2">
-                <Download className="w-4 h-4" /> Export Products Only
-              </a>
-              <a href={`${API}/api/export/structured/images`} download className="btn btn-outline-secondary w-full gap-2">
-                <Download className="w-4 h-4" /> Export Images Only
-              </a>
+              <button onClick={() => handleExport('zip_all', '/api/export/structured')} disabled={exporting !== null} className="btn btn-outline-secondary w-full gap-2 text-left justify-center">
+                {exporting === 'zip_all' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Everything
+              </button>
+              <button onClick={() => handleExport('zip_data', '/api/export/structured/data')} disabled={exporting !== null} className="btn btn-outline-secondary w-full gap-2 text-left justify-center">
+                {exporting === 'zip_data' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Products Only
+              </button>
+              <button onClick={() => handleExport('zip_images', '/api/export/structured/images')} disabled={exporting !== null} className="btn btn-outline-secondary w-full gap-2 text-left justify-center">
+                {exporting === 'zip_images' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export Images Only
+              </button>
            </div>
         </div>
       </aside>
 
-      {/* Main Content */}
       <div className="flex-1 flex flex-col overflow-hidden">
         
-        {/* Header */}
         <header className="flex-none bg-white dark:bg-[#0e1726] border-b border-white-light dark:border-[#1b2e4b] px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <button onClick={() => setSidebarOpen(!sidebarOpen)} className="p-2 rounded-full hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b] transition-colors text-black dark:text-white">
@@ -264,33 +298,29 @@ export default function App() {
             </h1>
           </div>
 
-          <div className="flex items-center gap-4">
-             <form onSubmit={startScrape} className="flex items-center gap-2">
+          <div className="flex items-center gap-4 flex-1 justify-end ml-4">
+             <form onSubmit={startScrape} className="flex items-center gap-2 flex-1 max-w-4xl justify-end">
                 <input
                   type="text"
-                  placeholder="Target URL (or blank)"
+                  placeholder="Target URL (leave blank for all)"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                   disabled={scraping}
-                  className="form-input w-40 sm:w-56"
+                  className="form-input w-full min-w-[200px]"
                 />
                 
-                <div className="relative group flex items-center">
-                  <div className="absolute left-3 text-[#888ea8] pointer-events-none">
-                    <Users className="w-4 h-4" />
-                  </div>
+                <div className="relative flex items-center bg-white dark:bg-[#121e32] border border-white-light dark:border-[#17263c] rounded-md px-3 h-[38px] flex-none">
+                  <label className="text-[#888ea8] font-semibold text-xs uppercase tracking-wider mr-2 flex items-center gap-1">
+                    <Users className="w-3.5 h-3.5" /> Workers
+                  </label>
                   <input
                     type="number"
                     min="1" max="100"
-                    title="Concurrent Workers"
                     value={workers}
                     onChange={(e) => setWorkers(parseInt(e.target.value) || 1)}
                     disabled={scraping}
-                    className="form-input w-24 pl-9 text-center"
+                    className="w-12 bg-transparent text-black dark:text-white text-center font-bold outline-none"
                   />
-                  <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 w-max px-2 py-1 bg-black dark:bg-[#0e1726] border border-white-light dark:border-[#1b2e4b] shadow-lg text-white text-xs rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50">
-                    Concurrent Workers
-                  </div>
                 </div>
 
                 {scraping ? (
@@ -312,7 +342,6 @@ export default function App() {
           </div>
         </header>
 
-        {/* Progress Bar (if scraping or completed) */}
         {progress.total > 0 && (
           <div className="flex-none sticky top-0 z-50 bg-white/95 dark:bg-[#0e1726]/95 backdrop-blur-sm border-b border-white-light dark:border-[#1b2e4b] px-6 py-3 shadow-sm">
             <div className="flex justify-between items-end mb-2">
@@ -339,13 +368,10 @@ export default function App() {
           </div>
         )}
 
-        {/* Dynamic View Content */}
         <div className="flex-1 overflow-hidden flex flex-col">
           
-          {/* PRODUCTS VIEW */}
           {view === 'products' && (
             <div className="flex-1 flex flex-col h-full overflow-hidden">
-               {/* Metrics Dashboard */}
                {hasProducts && (
                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 p-4 pb-0 bg-[#fafafa] dark:bg-[#060818]">
                    <div className="panel p-4 flex items-center justify-between border-l-4 border-l-primary">
@@ -387,7 +413,6 @@ export default function App() {
                  </div>
                )}
 
-               {/* Search & Filter Bar */}
                {hasProducts && (
                  <div className="flex-none bg-white/50 dark:bg-[#0e1726]/50 border-b border-white-light dark:border-[#1b2e4b] p-4 flex gap-4 items-center">
                     <button 
@@ -474,7 +499,6 @@ export default function App() {
                 </div>
                </div>
 
-               {/* Pagination Controls */}
                {totalPages > 0 && (
                  <div className="flex-none bg-white dark:bg-[#0e1726] border-t border-white-light dark:border-[#1b2e4b] p-4 flex flex-col sm:flex-row items-center justify-between gap-4">
                     <div className="flex items-center gap-2">
@@ -524,7 +548,6 @@ export default function App() {
             </div>
           )}
 
-          {/* FILES VIEW */}
           {view === 'files' && (
             <div className="h-full flex flex-col p-6">
               <div className="panel flex-1 flex flex-col">
@@ -574,7 +597,6 @@ export default function App() {
             </div>
           )}
 
-          {/* LOGS VIEW */}
           {view === 'logs' && (
             <div className="h-full flex flex-col p-6">
               <div className="panel flex-1 flex flex-col">
@@ -582,7 +604,8 @@ export default function App() {
                   <h3 className="text-lg font-bold text-black dark:text-white">Terminal Output</h3>
                   <span className="badge badge-success px-3 py-1">Running</span>
                 </div>
-                <div className="terminal flex-1 min-h-0 p-4">
+                <div className="terminal flex-1 p-4 h-full overflow-y-auto">
+                  {logs.length === 0 && <div className="text-[#888ea8]">Waiting for logs...</div>}
                   {logs.map((line, i) => {
                     const isError = line.includes('ERROR');
                     const isWarn = line.includes('WARNING');
