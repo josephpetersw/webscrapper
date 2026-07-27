@@ -2,6 +2,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import json
 import csv
 import io
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 LOG_FILE = os.path.join(BASE_DIR, 'scraper.log')
-VENV_PYTHON = os.path.join(BASE_DIR, 'venv', 'bin', 'python')
+VENV_PYTHON = sys.executable  # the interpreter running this Flask process (the venv's python)
 MAIN_SCRIPT = os.path.join(BASE_DIR, 'main.py')
 
 # Track running scraper process
