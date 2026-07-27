@@ -1,0 +1,19 @@
+# Virtual environments
+venv/
+env/
+.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Project Data & Logs
+data/
+*.log
+product.html
+
+# IDE/System
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,73 @@
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+@variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-primary: #4361ee;
+  --color-secondary: #805dca;
+  --color-success: #00ab55;
+  --color-danger: #e7515a;
+  --color-warning: #e2a03f;
+  --color-info: #2196f3;
+  --color-dark: #3b3f5c;
+  --color-white-light: #e0e6ed;
+}
+
+@layer base {
+  body {
+    @apply text-[#888ea8] bg-[#fafafa] dark:bg-[#060818] antialiased selection:bg-primary selection:text-white;
+    font-family: 'Nunito', sans-serif;
+  }
+}
+
+@layer components {
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #e0e6ed;
+    border-radius: 10px;
+  }
+  .dark ::-webkit-scrollbar-thumb {
+    background: #3b3f5c;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .panel {
+    @apply bg-white dark:bg-[#0e1726] shadow-[0_5px_20px_0_rgba(41,26,204,0.12)] rounded-md border border-white-light dark:border-[#1b2e4b] p-5;
+  }
+
+  .form-input {
+    @apply w-full border border-white-light dark:border-[#17263c] bg-white dark:bg-[#121e32] text-black dark:text-white rounded-md px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-0 transition-colors;
+  }
+
+  .btn {
+    @apply inline-flex justify-center items-center rounded-md font-semibold transition-colors duration-300 px-5 py-2 text-sm;
+  }
+  .btn-primary {
+    @apply bg-primary text-white hover:bg-[#344dce] shadow-[0_10px_20px_-10px_rgba(67,97,238,0.44)];
+  }
+  .btn-danger {
+    @apply bg-danger text-white hover:bg-[#c2434b] shadow-[0_10px_20px_-10px_rgba(231,81,90,0.44)];
+  }
+  .btn-outline-primary {
+    @apply border border-primary text-primary hover:bg-primary hover:text-white shadow-[0_10px_20px_-10px_rgba(67,97,238,0.44)];
+  }
+  .btn-outline-secondary {
+    @apply border border-secondary text-secondary hover:bg-secondary hover:text-white shadow-[0_10px_20px_-10px_rgba(128,93,202,0.44)];
+  }
+
+  .badge {
+    @apply bg-primary/10 text-primary py-0.5 px-2 rounded font-semibold text-xs;
+  }
+  .badge-success {
+    @apply bg-success/10 text-success;
+  }
+
+  .terminal {
+    @apply bg-[#0e1726] text-[#00ab55] font-mono text-[13px] leading-relaxed rounded-md overflow-y-auto;
+  }
+}
