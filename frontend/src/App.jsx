@@ -40,6 +40,11 @@ export default function App() {
   const [exportSites, setExportSites] = useState([]);
   const [exportFormats, setExportFormats] = useState(['csv']);
   const [exportClean, setExportClean] = useState(true);
+  const [exportJob, setExportJob] = useState(null);
+  const [selectedSites, setSelectedSites] = useState([]);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+  const exportPollRef = useRef(null);
   
   const [files, setFiles] = useState([]);
   const [currentPath, setCurrentPath] = useState([]);
@@ -156,6 +161,31 @@ export default function App() {
     } catch {}
   };
 
+  const deleteSites = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(`${API}/api/sites/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ names: deleteTarget.names }),
+      });
+      const data = await res.json();
+      if (data.status === 'success') {
+        setDeleteTarget(null);
+        setSelectedSites([]);
+        setProducts([]);
+        setCurrentPath([]);
+        await Promise.all([fetchSites(), fetchFiles(), fetchStats(), fetchSystemStatus()]);
+      } else {
+        setDeleteTarget({ ...deleteTarget, error: data.message || 'Could not delete.' });
+      }
+    } catch (e) {
+      setDeleteTarget({ ...deleteTarget, error: e.message });
+    }
+    setDeleting(false);
+  };
+
   const wipeEverything = async () => {
     setWiping(true);
     try {
@@ -186,32 +216,50 @@ export default function App() {
   const toggleIn = (list, value) =>
     list.includes(value) ? list.filter(v => v !== value) : [...list, value];
 
+  // Exports run as a background job on the server: a full image archive is
+  // thousands of files and far too slow to hold a request open for.
   const runBundleExport = async () => {
-    setExporting('bundle');
+    setExportOpen(false);
+    setExportJob({ state: 'queued', step: 0, total_steps: exportSites.length * exportFormats.length,
+                   message: 'Starting export…' });
     try {
-      const res = await fetch(`${API}/api/export/bundle`, {
+      const res = await fetch(`${API}/api/export/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sites: exportSites, formats: exportFormats, clean: exportClean }),
       });
-      if (!res.ok) throw new Error((await res.json()).error || 'Export failed');
-
-      const disposition = res.headers.get('Content-Disposition') || '';
-      const match = disposition.match(/filename=([^;]+)/);
-      const blob = await res.blob();
-      const href = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = href;
-      a.download = (match ? match[1] : 'export.zip').replace(/["']/g, '').trim();
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(href);
-      document.body.removeChild(a);
-      setExportOpen(false);
+      const started = await res.json();
+      if (!res.ok) throw new Error(started.error || 'Could not start export');
+      pollExportJob(started.job_id);
     } catch (e) {
-      console.error('Export failed', e);
+      setExportJob({ state: 'error', error: e.message, message: 'Export failed' });
     }
-    setExporting(null);
+  };
+
+  const pollExportJob = (jobId) => {
+    clearInterval(exportPollRef.current);
+    exportPollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`${API}/api/export/status/${jobId}`);
+        const job = await res.json();
+        if (!res.ok) throw new Error(job.error || 'Export job lost');
+        setExportJob({ ...job, jobId });
+        if (job.state === 'ready' || job.state === 'error') {
+          clearInterval(exportPollRef.current);
+        }
+      } catch (e) {
+        clearInterval(exportPollRef.current);
+        setExportJob({ state: 'error', error: e.message, message: 'Export failed' });
+      }
+    }, 700);
+  };
+
+  const downloadExportJob = () => {
+    if (!exportJob?.jobId) return;
+    // Plain navigation: the browser streams a multi-hundred-MB file straight
+    // to disk instead of buffering it in memory as a blob.
+    window.location.href = `${API}/api/export/download/${exportJob.jobId}`;
+    setExportJob(null);
   };
 
   const handleExport = async (type, endpoint) => {
@@ -902,6 +950,62 @@ export default function App() {
                 );
               })()}
 
+              {sites.length > 0 && (
+                <div className="panel p-0 mb-6 overflow-hidden">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-5 py-4 border-b border-white-light dark:border-[#1b2e4b]">
+                    <div>
+                      <h4 className="font-bold text-black dark:text-white">Scraped sites</h4>
+                      <p className="text-xs text-[#888ea8]">
+                        {sites.length} site{sites.length === 1 ? '' : 's'} stored ·{' '}
+                        {sites.reduce((n, s) => n + s.products, 0).toLocaleString()} products total
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => setSelectedSites(selectedSites.length === sites.length ? [] : sites.map(s => s.name))}
+                        className="btn btn-outline-secondary py-1.5 px-3 text-xs">
+                        {selectedSites.length === sites.length ? 'Clear selection' : 'Select all'}
+                      </button>
+                      <button
+                        onClick={() => setDeleteTarget({ names: selectedSites })}
+                        disabled={selectedSites.length === 0}
+                        className="btn btn-outline-danger py-1.5 px-3 text-xs gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+                        <Trash2 className="w-3.5 h-3.5" />
+                        Delete selected{selectedSites.length > 0 ? ` (${selectedSites.length})` : ''}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="divide-y divide-white-light dark:divide-[#1b2e4b]">
+                    {sites.map(s => {
+                      const picked = selectedSites.includes(s.name);
+                      return (
+                        <div key={s.name} className={`flex items-center gap-3 px-5 py-3 transition-colors ${picked ? 'bg-primary/5' : ''}`}>
+                          <input type="checkbox" checked={picked}
+                            onChange={() => setSelectedSites(toggleIn(selectedSites, s.name))}
+                            className="accent-[#4361ee] flex-none" />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold text-black dark:text-white text-sm truncate">{s.name}</span>
+                              {s.active && <span className="badge badge-success flex-none">viewing</span>}
+                            </div>
+                            <p className="text-xs text-[#888ea8]">
+                              {s.products.toLocaleString()} products · scraped {formatRelativeTime(s.modified)}
+                              {s.failed > 0 && <span className="text-warning"> · {s.failed.toLocaleString()} failed</span>}
+                            </p>
+                          </div>
+                          <button onClick={() => setDeleteTarget({ names: [s.name] })}
+                            title={`Delete ${s.name}`}
+                            className="p-2 rounded-md text-[#888ea8] hover:bg-danger/10 hover:text-danger transition-colors flex-none">
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
                 {systemStatus.services.length === 0 ? (
                   <div className="col-span-full py-16 text-center text-[#888ea8]">Loading service health…</div>
@@ -985,6 +1089,124 @@ export default function App() {
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Export progress */}
+      {exportJob && (() => {
+        const done = exportJob.state === 'ready';
+        const failed = exportJob.state === 'error';
+        const pct = exportJob.total_steps
+          ? Math.min(100, Math.round(((exportJob.step || 0) / exportJob.total_steps) * 100)) : 0;
+        return (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-[#0e1726] rounded-lg shadow-xl w-full max-w-md flex flex-col overflow-hidden animate-[scaleIn_0.2s_ease-out]">
+              <div className="flex items-center gap-3 px-6 py-4 border-b border-white-light dark:border-[#1b2e4b]">
+                <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-none ${
+                  failed ? 'bg-danger/10 text-danger' : done ? 'bg-success/10 text-success' : 'bg-primary/10 text-primary'}`}>
+                  {failed ? <XCircle className="w-5 h-5" />
+                    : done ? <CheckCircle className="w-5 h-5" />
+                    : <Loader2 className="w-5 h-5 animate-spin" />}
+                </div>
+                <h3 className="text-lg font-bold text-black dark:text-white">
+                  {failed ? 'Export failed' : done ? 'Export ready' : 'Preparing export'}
+                </h3>
+              </div>
+
+              <div className="p-6 space-y-4">
+                {!failed && (
+                  <>
+                    <div>
+                      <div className="flex justify-between items-baseline mb-2">
+                        <span className="text-sm font-semibold text-black dark:text-white">
+                          {done ? 'Complete' : `Step ${Math.min((exportJob.step || 0) + 1, exportJob.total_steps || 1)} of ${exportJob.total_steps || 1}`}
+                        </span>
+                        <span className="text-sm font-bold text-primary">{done ? 100 : pct}%</span>
+                      </div>
+                      <div className="w-full h-2 bg-[#ebebeb] dark:bg-[#1b2e4b] rounded-full overflow-hidden">
+                        <div className={`h-full rounded-full transition-all duration-300 ${done ? 'bg-success' : 'bg-primary'}`}
+                             style={{ width: `${done ? 100 : Math.max(pct, 4)}%` }} />
+                      </div>
+                    </div>
+                    <p className="text-sm text-[#888ea8] break-words">{exportJob.message}</p>
+                  </>
+                )}
+
+                {done && (
+                  <div className="rounded-md border border-white-light dark:border-[#1b2e4b] p-4 space-y-1">
+                    <p className="font-mono text-sm text-black dark:text-white break-all">{exportJob.filename}</p>
+                    {exportJob.size != null && (
+                      <p className="text-xs text-[#888ea8]">{(exportJob.size / 1048576).toFixed(1)} MB</p>
+                    )}
+                  </div>
+                )}
+
+                {failed && <p className="text-sm text-danger break-words">{exportJob.error || exportJob.message}</p>}
+
+                {!done && !failed && (
+                  <p className="text-xs text-[#888ea8] leading-relaxed">
+                    Large exports with images can take a few minutes. You can leave this open —
+                    the work continues on the server.
+                  </p>
+                )}
+              </div>
+
+              <div className="flex justify-end gap-2 px-6 py-4 border-t border-white-light dark:border-[#1b2e4b]">
+                <button onClick={() => { clearInterval(exportPollRef.current); setExportJob(null); }}
+                  className="btn btn-outline-secondary">
+                  {done || failed ? 'Close' : 'Hide'}
+                </button>
+                {done && (
+                  <button onClick={downloadExportJob} className="btn btn-primary gap-2">
+                    <Download className="w-4 h-4" /> Download
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Delete sites */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => !deleting && setDeleteTarget(null)}>
+          <div className="bg-white dark:bg-[#0e1726] rounded-lg shadow-xl w-full max-w-lg flex flex-col overflow-hidden animate-[scaleIn_0.2s_ease-out]" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-3 px-6 py-4 border-b border-white-light dark:border-[#1b2e4b]">
+              <div className="w-10 h-10 rounded-full bg-danger/10 text-danger flex items-center justify-center flex-none">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <h3 className="text-lg font-bold text-black dark:text-white">
+                Delete {deleteTarget.names.length === 1 ? 'this scrape' : `${deleteTarget.names.length} scrapes`}?
+              </h3>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <p className="text-[#888ea8] leading-relaxed">
+                This permanently deletes the products, images and files for
+                {deleteTarget.names.length === 1 ? ' this scrape' : ' these scrapes'}. It cannot be undone.
+              </p>
+              <div className="rounded-md border border-danger/30 bg-danger/5 p-4 space-y-1.5 max-h-52 overflow-y-auto">
+                {deleteTarget.names.map(name => {
+                  const info = sites.find(s => s.name === name);
+                  return (
+                    <div key={name} className="flex items-center justify-between gap-4 text-sm">
+                      <span className="font-mono text-black dark:text-white truncate">{name}</span>
+                      <span className="text-[#888ea8] flex-none">{(info?.products ?? 0).toLocaleString()} products</span>
+                    </div>
+                  );
+                })}
+              </div>
+              {deleteTarget.error && <p className="text-sm text-danger font-semibold">{deleteTarget.error}</p>}
+            </div>
+
+            <div className="flex justify-end gap-2 px-6 py-4 border-t border-white-light dark:border-[#1b2e4b]">
+              <button onClick={() => setDeleteTarget(null)} disabled={deleting} className="btn btn-outline-secondary">Cancel</button>
+              <button onClick={deleteSites} disabled={deleting} className="btn btn-danger gap-2 disabled:opacity-50">
+                {deleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                {deleting ? 'Deleting…' : 'Delete'}
+              </button>
             </div>
           </div>
         </div>

@@ -12,6 +12,7 @@ import shutil
 import platform
 import threading
 import zipfile
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from flask import Flask, jsonify, request, send_from_directory, Response
@@ -33,56 +34,6 @@ MAIN_SCRIPT = os.path.join(BASE_DIR, 'main.py')
 scraper_process = None
 
 APP_START_TIME = time.time()
-
-# ── Target Site Reachability (checked in the background so status
-# requests never block on a live network call) ──────────────────
-TARGET_SITE_CHECK_INTERVAL = 60  # seconds
-_target_site_lock = threading.Lock()
-_target_site_state = {'status': 'checking', 'name': 'Target Site',
-                      'detail': 'Awaiting first check...', 'checked_at': None}
-
-def target_site_domain():
-    """Domain of the active site, so the health check follows whatever is being scraped."""
-    name = active_site_name()
-    if not name:
-        return None
-    # Strip any _v2_<timestamp> suffix back to the bare domain.
-    return re.sub(r'_v\d+_\d{8}-\d{6}$', '', name)
-
-def _check_target_site_loop():
-    from curl_cffi import requests as curl_requests
-    while True:
-        domain = target_site_domain()
-        if not domain:
-            with _target_site_lock:
-                _target_site_state.update({
-                    'status': 'checking', 'name': 'Target Site',
-                    'detail': 'No site scraped yet', 'checked_at': None})
-            time.sleep(TARGET_SITE_CHECK_INTERVAL)
-            continue
-        try:
-            start = time.time()
-            session = curl_requests.Session(impersonate="chrome")
-            resp = session.get(f'https://{domain}', timeout=10)
-            elapsed_ms = round((time.time() - start) * 1000)
-            with _target_site_lock:
-                _target_site_state['name'] = domain
-                if resp.status_code == 200:
-                    _target_site_state['status'] = 'operational'
-                    _target_site_state['detail'] = f'Responded 200 OK in {elapsed_ms}ms'
-                else:
-                    _target_site_state['status'] = 'warning'
-                    _target_site_state['detail'] = f'Responded HTTP {resp.status_code} in {elapsed_ms}ms'
-                _target_site_state['checked_at'] = datetime.now(timezone.utc).isoformat()
-        except Exception as e:
-            with _target_site_lock:
-                _target_site_state['name'] = domain
-                _target_site_state['status'] = 'down'
-                _target_site_state['detail'] = f'Unreachable: {e}'
-                _target_site_state['checked_at'] = datetime.now(timezone.utc).isoformat()
-        time.sleep(TARGET_SITE_CHECK_INTERVAL)
-
-threading.Thread(target=_check_target_site_loop, daemon=True).start()
 
 def human_size(num_bytes):
     size = float(num_bytes)
@@ -331,6 +282,56 @@ def analyze_site_route():
                         'warnings': [f'Could not analyze this site: {e}'],
                         'notes': [], 'sitemaps': [], 'product_sitemaps': [], 'apis': []})
 
+@app.route('/api/sites/delete', methods=['POST'])
+def delete_sites():
+    """Delete one, several, or all scraped sites."""
+    global scraper_process
+    if scraper_process and scraper_process.poll() is None:
+        return jsonify({'status': 'error',
+                        'message': 'A scrape is running. Stop it before deleting sites.'}), 409
+
+    body = request.json or {}
+    names = body.get('names') or []
+    if body.get('all'):
+        names = list_site_dirs()
+    # Only ever touch real site folders directly under data/.
+    names = [n for n in names
+             if not n.startswith('.') and os.path.isdir(os.path.join(DATA_DIR, n))
+             and os.path.dirname(os.path.abspath(os.path.join(DATA_DIR, n))) == os.path.abspath(DATA_DIR)]
+    if not names:
+        return jsonify({'status': 'error', 'message': 'No matching sites to delete.'}), 400
+
+    was_active = active_site_name()
+    deleted, failed = [], []
+    for name in names:
+        try:
+            shutil.rmtree(os.path.join(DATA_DIR, name))
+            deleted.append(name)
+        except Exception as e:
+            logger.error(f"Could not delete site {name}: {e}")
+            failed.append({'name': name, 'error': str(e)})
+
+    # Drop cache entries pointing into the removed folders.
+    for path in [p for p in list(_CACHE)
+                 if any(os.path.join(DATA_DIR, n) in p for n in deleted)]:
+        _CACHE.pop(path, None)
+
+    # If the site on screen just went away, point at whatever remains.
+    if was_active in deleted:
+        remaining = list_site_dirs()
+        try:
+            if remaining:
+                with open(ACTIVE_SITE_FILE, 'w', encoding='utf-8') as f:
+                    f.write(remaining[0])
+            elif os.path.exists(ACTIVE_SITE_FILE):
+                os.remove(ACTIVE_SITE_FILE)
+        except Exception as e:
+            logger.error(f"Could not update active site after deletion: {e}")
+
+    logger.info(f"Deleted {len(deleted)} site(s): {', '.join(deleted)}")
+    return jsonify({'status': 'success', 'deleted': deleted, 'failed': failed,
+                    'active': active_site_name()})
+
 # ── Wipe ─────────────────────────────────────────────────────
 @app.route('/api/system/wipe', methods=['POST'])
 def wipe_everything():
@@ -428,13 +429,6 @@ def system_status():
     else:
         services.append({'id': 'logging', 'name': 'Logging', 'category': 'Core', 'icon': 'file-text',
                           'status': 'warning', 'detail': 'No log file yet — run a scrape to generate one'})
-
-    # 6. Target site (external dependency, checked in the background)
-    with _target_site_lock:
-        ts = dict(_target_site_state)
-    services.append({'id': 'target_site', 'name': ts.get('name') or 'Target Site',
-                      'category': 'External', 'icon': 'globe',
-                      'status': ts['status'], 'detail': ts['detail'], 'checked_at': ts['checked_at']})
 
     # 7. Disk space
     try:
@@ -975,7 +969,7 @@ ARCHIVE_FORMATS = {
     'archive_images': ('images-only', lambda name: name == 'images'),
 }
 
-def add_structured_to_zip(zipf, site, fmt, prefix):
+def add_structured_to_zip(zipf, site, fmt, prefix, on_progress=None):
     structured = os.path.join(DATA_DIR, site, 'structured')
     if not os.path.isdir(structured):
         return 0
@@ -993,9 +987,164 @@ def add_structured_to_zip(zipf, site, fmt, prefix):
             try:
                 zipf.write(full, arc)
                 written += 1
+                # Archives can run to thousands of files; report periodically
+                # so the UI keeps moving instead of appearing to hang.
+                if on_progress and written % 50 == 0:
+                    on_progress(written)
             except Exception as e:
                 logger.error(f"Skipping {full} in archive: {e}")
+    if on_progress:
+        on_progress(written)
     return written
+
+
+# ── Export jobs ───────────────────────────────────────────────
+# Exports can take minutes (a full image archive is thousands of files), which
+# is far too long to hold a request open. Work happens on a background thread
+# and the client polls for progress.
+_export_jobs = {}
+_export_jobs_lock = threading.Lock()
+EXPORT_JOB_TTL = 3600  # seconds to keep a finished export around for download
+
+FORMAT_LABELS = {
+    'json': 'JSON', 'csv': 'CSV', 'excel': 'Excel', 'xml': 'XML',
+    'categories': 'category list', 'brands': 'brand list',
+    'archive_all': 'full archive', 'archive_data': 'data archive',
+    'archive_images': 'image archive',
+}
+
+def _job_update(job_id, **fields):
+    with _export_jobs_lock:
+        if job_id in _export_jobs:
+            _export_jobs[job_id].update(fields)
+
+def _purge_old_export_jobs():
+    now = time.time()
+    with _export_jobs_lock:
+        stale = [jid for jid, job in _export_jobs.items()
+                 if now - job.get('created', now) > EXPORT_JOB_TTL]
+        for jid in stale:
+            path = _export_jobs[jid].get('path')
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            del _export_jobs[jid]
+
+def _run_export_job(job_id, sites, formats, clean):
+    suffix = '' if clean else 'raw_'
+    steps = [(site, fmt) for site in sites for fmt in formats]
+    _job_update(job_id, state='running', total_steps=len(steps), step=0,
+                message='Preparing…')
+
+    try:
+        products_cache = {}
+
+        def products_for(site):
+            if site not in products_cache:
+                _job_update(job_id, message=f'Loading products for {site}…')
+                products_cache[site] = load_json_cached(
+                    os.path.join(DATA_DIR, site, 'products.json'), [])
+            return products_cache[site]
+
+        # A single plain file needs no ZIP wrapper.
+        if len(sites) == 1 and len(formats) == 1 and formats[0] in EXPORT_BUILDERS:
+            site, fmt = sites[0], formats[0]
+            filename, builder = EXPORT_BUILDERS[fmt]
+            _job_update(job_id, step=0, message=f'Building {FORMAT_LABELS.get(fmt, fmt)} for {site}…')
+            payload = builder(products_for(site), clean)
+            path = os.path.join(export_workspace(), f'{job_id}_{filename}')
+            with open(path, 'wb') as f:
+                f.write(payload)
+            _job_update(job_id, state='ready', step=1, path=path,
+                        filename=f"{site.replace('.', '_')}_{suffix}{filename}",
+                        size=os.path.getsize(path), message='Ready to download')
+            return
+
+        path = os.path.join(export_workspace(), f'{job_id}.zip')
+        with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for index, (site, fmt) in enumerate(steps, start=1):
+                label = FORMAT_LABELS.get(fmt, fmt)
+                _job_update(job_id, step=index - 1,
+                            message=f'Building {label} for {site}…')
+                folder = site if len(sites) > 1 else ''
+                try:
+                    if fmt in EXPORT_BUILDERS:
+                        filename, builder = EXPORT_BUILDERS[fmt]
+                        zipf.writestr(os.path.join(folder, f'{suffix}{filename}'),
+                                      builder(products_for(site), clean))
+                    else:
+                        archive_label = ARCHIVE_FORMATS[fmt][0]
+
+                        def progress(count, _site=site, _label=label):
+                            _job_update(job_id,
+                                        message=f'Adding {_label} for {_site}… {count:,} files')
+
+                        add_structured_to_zip(zipf, site, fmt,
+                                              os.path.join(folder, archive_label),
+                                              on_progress=progress)
+                except Exception as e:
+                    # One bad format must not cost the rest of the bundle.
+                    logger.error(f"Export {fmt} for {site} failed: {e}")
+                    zipf.writestr(os.path.join(folder, f'{fmt}_FAILED.txt'), str(e))
+                _job_update(job_id, step=index)
+
+        _job_update(job_id, message='Compressing…')
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        name = (f"export_{sites[0].replace('.', '_')}_{stamp}.zip" if len(sites) == 1
+                else f"export_{len(sites)}_sites_{stamp}.zip")
+        _job_update(job_id, state='ready', path=path, filename=name,
+                    size=os.path.getsize(path), message='Ready to download')
+    except Exception as e:
+        logger.error(f"Export job {job_id} failed: {e}")
+        _job_update(job_id, state='error', error=str(e), message='Export failed')
+
+@app.route('/api/export/start', methods=['POST'])
+def start_export():
+    body = request.json or {}
+    sites = [s for s in (body.get('sites') or []) if os.path.isdir(os.path.join(DATA_DIR, s))]
+    formats = [f for f in (body.get('formats') or [])
+               if f in EXPORT_BUILDERS or f in ARCHIVE_FORMATS]
+    clean = bool(body.get('clean', True))
+
+    if not sites:
+        return jsonify({'error': 'Select at least one site to export.'}), 400
+    if not formats:
+        return jsonify({'error': 'Select at least one export format.'}), 400
+
+    _purge_old_export_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    with _export_jobs_lock:
+        _export_jobs[job_id] = {
+            'id': job_id, 'state': 'queued', 'step': 0,
+            'total_steps': len(sites) * len(formats),
+            'message': 'Queued…', 'created': time.time(),
+            'sites': sites, 'formats': formats,
+        }
+    threading.Thread(target=_run_export_job, args=(job_id, sites, formats, clean),
+                     daemon=True).start()
+    return jsonify({'job_id': job_id})
+
+@app.route('/api/export/status/<job_id>', methods=['GET'])
+def export_status(job_id):
+    with _export_jobs_lock:
+        job = _export_jobs.get(job_id)
+        if not job:
+            return jsonify({'error': 'Unknown or expired export job'}), 404
+        return jsonify({k: v for k, v in job.items() if k != 'path'})
+
+@app.route('/api/export/download/<job_id>', methods=['GET'])
+def export_download(job_id):
+    with _export_jobs_lock:
+        job = _export_jobs.get(job_id)
+    if not job or job.get('state') != 'ready':
+        return jsonify({'error': 'Export is not ready'}), 404
+    path = job.get('path')
+    if not path or not os.path.exists(path):
+        return jsonify({'error': 'Export file is no longer available'}), 404
+    return send_from_directory(os.path.dirname(path), os.path.basename(path),
+                               as_attachment=True, download_name=job['filename'])
 
 @app.route('/api/export/bundle', methods=['POST'])
 def export_bundle():

@@ -188,6 +188,16 @@ when nothing has been scraped, so `os.path.exists()` treats it as missing.
 Dotfiles are filtered out of `/api/files`, keeping `.active_site` and
 `.exports/` out of the File Explorer.
 
+**Exports run as background jobs.** A full image archive is thousands of files
+and hundreds of megabytes — far too slow to hold a request open for, and the
+UI would look hung. `/api/export/start` spawns a thread, the client polls
+`/api/export/status/<id>` for a step counter and a live message (archive
+packing reports every 50 files), then fetches `/api/export/download/<id>`.
+The browser is sent to the download URL directly rather than buffering a
+blob, so a 700MB file streams to disk instead of into memory. Finished jobs
+and their files are purged after an hour, and `.exports/` is scratch space —
+safe to delete at any time.
+
 ## API surface (all under `app.py`)
 
 | Route | Method | Purpose |
@@ -202,7 +212,11 @@ Dotfiles are filtered out of `/api/files`, keeping `.active_site` and
 | `/api/sites/active` | POST | Switch which site the dashboard shows |
 | `/api/site/check` | GET | `?url=` → whether that store already has data; drives the update-vs-new-version prompt |
 | `/api/site/analyze` | GET | `?url=` → platform, theme, plugins, sitemaps, APIs, estimated product count. Advisory only — never blocks a scrape |
-| `/api/export/bundle` | POST | `{sites[], formats[], clean}` → one file if a single site+format, otherwise a ZIP with a folder per site |
+| `/api/export/bundle` | POST | Synchronous export. Kept for scripting; the dashboard uses the job endpoints below |
+| `/api/export/start` | POST | `{sites[], formats[], clean}` → `{job_id}`, work runs on a background thread |
+| `/api/export/status/<job_id>` | GET | `{state, step, total_steps, message, filename, size}` — polled for the progress dialog |
+| `/api/export/download/<job_id>` | GET | Serves the finished file; jobs expire after `EXPORT_JOB_TTL` (1h) |
+| `/api/sites/delete` | POST | `{names[]}` or `{all: true}`. Refuses (409) while a scrape runs; repoints the active site if it was deleted |
 | `/api/logs` | GET | Tail of `scraper.log` (`?lines=N`) |
 | `/api/progress` | GET | Contents of `data/progress.json` |
 | `/api/products` | GET | Paginated/filterable product list (`page`, `limit`, `search`, `category`) |
