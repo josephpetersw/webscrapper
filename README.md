@@ -1,6 +1,6 @@
-# PhonePlaceKenya Scraper
+# XphoneKenyaScraper
 
-A robust, concurrent, and UI-driven web scraping tool designed specifically for PhonePlaceKenya.com. This project handles Cloudflare bot protection using `curl_cffi`, supports high concurrency via `asyncio`, and presents a beautiful, responsive dashboard using React, TailwindCSS (Vristo theme styling), and Flask.
+A robust, concurrent, and UI-driven web scraping tool designed specifically for XphoneKenya.com. This project handles Cloudflare bot protection using `curl_cffi`, supports high concurrency via `asyncio`, and presents a beautiful, responsive dashboard using React, TailwindCSS (Vristo theme styling), and Flask.
 
 ## Features
 - **Smart Bot Evasion**: Bypasses Cloudflare checks seamlessly using `curl_cffi` impersonating a real browser.
