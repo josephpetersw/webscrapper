@@ -42,7 +42,10 @@ TITLE_SELECTORS = (
     'h1.page-title', '.page-title .base',  # Magento
     'h1[itemprop="name"]', '.product-name h1', 'h1.entry-title',
     'h1.product-single__title', '.product__title h1',  # Shopify themes
-    'h1.product-detail-name', '#product-title', 'h1',
+    'h1.product-detail-name', '#product-title',
+    # A bare 'h1' deliberately does not belong here: on plenty of themes the
+    # only h1 is the store name. It is tried last of all, after Open Graph and
+    # microdata, in the fallback chain in _parse_product_inner.
 )
 
 PRICE_SELECTORS = (
@@ -242,11 +245,11 @@ class Parser:
         data = {'url': url}
 
         # ── title ────────────────────────────────────────────────────────
-        title = ex._first_str(product.get('name'))
+        title = ex.first_str(product.get('name'))
         if title:
             sources['title'] = 'jsonld'
         if not title:
-            title, selector = _select_one_text(soup, TITLE_SELECTORS[:-1])
+            title, selector = _select_one_text(soup, TITLE_SELECTORS)
             if title:
                 sources['title'] = f'css:{selector}'
         if not title:
@@ -290,9 +293,11 @@ class Parser:
                 text = re.split(r'[–—]|\.\.\.', text)[0]
                 code, value = ex.split_price_text(text)
                 currency = currency or code
+                # Kept even when no number could be parsed: 'Call for price' is
+                # more use to a reader than a blank cell. The source is recorded
+                # either way, so extracted_by never disagrees with the field.
                 display = _clean_text(text)
-                if value is not None:
-                    sources['price'] = f'css:{selector}'
+                sources['price'] = f'css:{selector}'
         if value is None:
             micro = ex.microdata(soup, 'price')
             value = ex.to_number(micro)
@@ -330,8 +335,8 @@ class Parser:
         # useless — every product in the catalogue collapses to one brand — so
         # a brand that matches the store's own domain is rejected and the next
         # layer gets a turn.
-        site_key = _comparison_key(re.sub(r'^www\.|\.[a-z.]+$', '', ex._host(origin)))
-        brand = ex._first_str(product.get('brand')) or ex._first_str(product.get('manufacturer'))
+        site_key = _comparison_key(re.sub(r'^www\.|\.[a-z.]+$', '', ex.host_of(origin)))
+        brand = ex.first_str(product.get('brand')) or ex.first_str(product.get('manufacturer'))
         if brand and site_key and _comparison_key(brand) == site_key:
             brand = ''
         if brand:
@@ -354,7 +359,7 @@ class Parser:
         data['brand'] = _clean_text(brand) or 'Unknown'
 
         # ── sku ──────────────────────────────────────────────────────────
-        sku = ex._first_str(product.get('sku')) or ex._first_str(product.get('mpn'))
+        sku = ex.first_str(product.get('sku')) or ex.first_str(product.get('mpn'))
         if not sku:
             sku = ex.microdata(soup, 'sku')
         if not sku:
@@ -367,7 +372,7 @@ class Parser:
         if short_html:
             sources['short_description'] = f'css:{selector}'
         else:
-            fallback = (ex._first_str(product.get('description'))
+            fallback = (ex.first_str(product.get('description'))
                         or ex.meta_content(soup, 'og:description', 'description'))
             if fallback:
                 # Re-escape: this came out of a JSON string or meta attribute,
@@ -454,8 +459,8 @@ class Parser:
 
         # 1. JSON-LD: str, list, or ImageObject(s).
         jsonld_images = []
-        for item in ex._as_list(product.get('image')):
-            got = ex._first_str(item)
+        for item in ex.as_list(product.get('image')):
+            got = ex.first_str(item)
             if got:
                 jsonld_images.append(got)
         if add(jsonld_images):

@@ -34,6 +34,9 @@ MAX_PATH = 260
 PATH_SAFETY_MARGIN = 12
 
 MAX_SEGMENT_LEN = 60
+# Shortest a folder name may be squeezed to: enough to keep its 6-char hash
+# plus a little of the original, so distinct products never share a directory.
+MIN_SEGMENT_LEN = 12
 MAX_FILENAME_LEN = 100
 MIN_FILENAME_LEN = 24
 
@@ -133,10 +136,10 @@ def build_product_dir(structured_root, categories, title, url='',
 
     if _full_len(candidate) > budget:
         # Categories are gone; shorten the product folder to whatever is left.
+        # The floor keeps the name long enough to still carry its hash, so two
+        # products cannot collapse onto one directory even in the worst case.
         base = os.path.join(structured_root, 'Uncategorized')
-        room = budget - _full_len(base) - 1
-        if room < 12:
-            room = 12
+        room = max(budget - _full_len(base) - 1, MIN_SEGMENT_LEN)
         name = safe_path_segment(title or url, max_len=room)
         candidate = os.path.join(base, name)
 

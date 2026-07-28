@@ -70,7 +70,7 @@ def unescape(value):
     return html_module.unescape(out) if '&' in out else out
 
 
-def _first_str(value):
+def first_str(value):
     """Pull a plain string out of the several shapes schema.org allows."""
     if isinstance(value, str):
         return unescape(value).strip()
@@ -84,13 +84,13 @@ def _first_str(value):
         return ''
     if isinstance(value, list):
         for item in value:
-            got = _first_str(item)
+            got = first_str(item)
             if got:
                 return got
     return ''
 
 
-def _as_list(value):
+def as_list(value):
     if value is None:
         return []
     return value if isinstance(value, list) else [value]
@@ -134,7 +134,7 @@ def jsonld_nodes(soup):
             elif isinstance(current, dict):
                 nodes.append(current)
                 if isinstance(current.get('@graph'), (list, dict)):
-                    stack.extend(_as_list(current['@graph']))
+                    stack.extend(as_list(current['@graph']))
                 # Some themes nest the Product inside a WebPage's mainEntity.
                 for key in ('mainEntity', 'mainEntityOfPage', 'item', 'about'):
                     nested = current.get(key)
@@ -169,10 +169,10 @@ def jsonld_breadcrumbs(nodes):
         if not (_BREADCRUMB_TYPES & set(_type_names(node))):
             continue
         items = []
-        for element in _as_list(node.get('itemListElement')):
+        for element in as_list(node.get('itemListElement')):
             if not isinstance(element, dict):
                 continue
-            name = _first_str(element.get('name')) or _first_str(element.get('item'))
+            name = first_str(element.get('name')) or first_str(element.get('item'))
             position = element.get('position')
             try:
                 position = int(position)
@@ -193,7 +193,7 @@ def offers_from(node):
     lowPrice/highPrice instead of price.
     """
     price_value, currency, availability = None, '', ''
-    for offer in _as_list(node.get('offers')):
+    for offer in as_list(node.get('offers')):
         if not isinstance(offer, dict):
             continue
         raw = (offer.get('price') if offer.get('price') not in (None, '')
@@ -203,8 +203,8 @@ def offers_from(node):
         value = to_number(raw)
         if value is not None and (price_value is None or value < price_value):
             price_value = value
-        currency = currency or _first_str(offer.get('priceCurrency'))
-        availability = availability or _first_str(offer.get('availability'))
+        currency = currency or first_str(offer.get('priceCurrency'))
+        availability = availability or first_str(offer.get('availability'))
     availability = re.split(r'[/#]', availability)[-1] if availability else ''
     return format_price(price_value, currency), price_value, currency.upper(), availability
 
@@ -293,7 +293,7 @@ def microdata(soup, prop):
     return ''
 
 
-def _host(url):
+def host_of(url):
     """Hostname of a URL, or '' — used to spot self-referential values."""
     try:
         from urllib.parse import urlparse

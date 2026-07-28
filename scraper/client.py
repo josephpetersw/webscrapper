@@ -47,6 +47,11 @@ DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF = 2.0
 DEFAULT_TIMEOUT = 30
 
+# After this many URLs on a host have failed the whole ladder, stop walking it.
+# Escalation is worth paying for once per host; paying for it on every URL of a
+# host that is simply blocking us turns a 3,000-product run into 27,000 requests.
+_EXHAUSTED_AFTER = 3
+
 # Bot walls that answer 200 with an interstitial instead of the page. Checked
 # against the first few KB only — these pages are always tiny and front-loaded.
 _CHALLENGE_MARKERS = (
@@ -110,12 +115,6 @@ def _host_of(url):
         return urlparse(url).netloc.lower()
     except Exception:
         return ''
-
-
-# After this many URLs on a host have failed the whole ladder, stop walking it.
-# Escalation is worth paying for once per host; paying for it on every URL of a
-# host that is simply blocking us turns a 3,000-product run into 27,000 requests.
-_EXHAUSTED_AFTER = 3
 
 
 class _ProfileMemo:
