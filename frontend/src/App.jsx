@@ -7,6 +7,9 @@ const API = 'http://localhost:5000';
 
 export default function App() {
   const [url, setUrl] = useState('');
+  const [bulkMode, setBulkMode] = useState(false);
+  const [bulkUrls, setBulkUrls] = useState('');
+  const [bulkProgress, setBulkProgress] = useState({ current: 0, total: 0, current_url: '' });
   const [workers, setWorkers] = useState(8);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [logs, setLogs] = useState([]);
@@ -86,6 +89,7 @@ export default function App() {
     const interval = setInterval(() => {
       fetchLogs();
       fetchProgress();
+      fetchBulkProgress();
       fetchStatus();
       fetchSystemStatus();
       fetchSites();
@@ -111,6 +115,14 @@ export default function App() {
       const res = await fetch(`${API}/api/progress`);
       const data = await res.json();
       setProgress(data);
+    } catch {}
+  };
+
+  const fetchBulkProgress = async () => {
+    try {
+      const res = await fetch(`${API}/api/bulk_progress`);
+      const data = await res.json();
+      setBulkProgress(data);
     } catch {}
   };
 
@@ -355,6 +367,12 @@ export default function App() {
   const requestScrape = async (e) => {
     e.preventDefault();
     if (scraping || loading) return;
+    
+    if (bulkMode) {
+      startBulkScrape();
+      return;
+    }
+
     setSiteCheck(null);
     setSiteAnalysis(null);
     setAnalyzing(true);
@@ -390,6 +408,29 @@ export default function App() {
       const data = await res.json();
       if (data.status === 'success') {
         setUrl('');
+        setScraping(true);
+        fetchSites();
+      }
+    } catch {}
+    setLoading(false);
+  };
+
+  const startBulkScrape = async () => {
+    setLoading(true);
+    const urlsToScrape = bulkUrls.split('\n').map(u => u.trim()).filter(u => u);
+    try {
+      const res = await fetch(`${API}/api/scrape/bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          urls: urlsToScrape,
+          workers: workers,
+          new_version: scrapeMode === 'new_version',
+        })
+      });
+      const data = await res.json();
+      if (data.status === 'success') {
+        setBulkUrls('');
         setScraping(true);
         fetchSites();
       }
@@ -510,7 +551,16 @@ export default function App() {
           >
             <Download className="w-4 h-4" /> Export Data
           </button>
-          <p className="text-[11px] text-[#888ea8] text-center mt-2 leading-relaxed">
+          
+          <button
+            onClick={() => setWipeOpen(true)}
+            className="btn btn-outline-danger w-full gap-2 justify-center mt-3"
+            title="Delete all saved scraped data and cache"
+          >
+            <Trash2 className="w-4 h-4" /> Wipe All Data
+          </button>
+
+          <p className="text-[11px] text-[#888ea8] text-center mt-3 leading-relaxed">
             {sites.length === 0
               ? 'Nothing to export yet'
               : `${sites.length} site${sites.length === 1 ? '' : 's'} available`}
@@ -548,17 +598,36 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-4 flex-1 justify-end ml-4">
-             <form onSubmit={requestScrape} className="flex items-center gap-2 flex-1 max-w-4xl justify-end">
-                <input
-                  type="text"
-                  placeholder="Store URL — the whole catalogue is discovered and crawled"
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  disabled={scraping}
-                  className="form-input w-full min-w-[200px]"
-                />
+             <form onSubmit={requestScrape} className={`flex ${bulkMode ? 'items-start' : 'items-center'} gap-2 flex-1 max-w-4xl justify-end`}>
+                <button
+                  type="button"
+                  onClick={() => setBulkMode(!bulkMode)}
+                  className={`btn flex-none ${bulkMode ? 'btn-secondary mt-1' : 'btn-outline-secondary'}`}
+                  title="Toggle Bulk Scrape Mode"
+                >
+                  Bulk
+                </button>
+                {bulkMode ? (
+                  <textarea
+                    placeholder="Paste multiple URLs here (one per line)"
+                    value={bulkUrls}
+                    onChange={(e) => setBulkUrls(e.target.value)}
+                    disabled={scraping}
+                    rows={3}
+                    className="form-textarea w-full min-w-[200px]"
+                  />
+                ) : (
+                  <input
+                    type="text"
+                    placeholder="Store URL — the whole catalogue is discovered and crawled"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    disabled={scraping}
+                    className="form-input w-full min-w-[200px]"
+                  />
+                )}
                 
-                <div className="relative flex items-center bg-white dark:bg-[#121e32] border border-white-light dark:border-[#17263c] rounded-md px-3 h-[38px] flex-none">
+                <div className={`relative flex items-center bg-white dark:bg-[#121e32] border border-white-light dark:border-[#17263c] rounded-md px-3 h-[38px] flex-none ${bulkMode ? 'mt-1' : ''}`}>
                   <label className="text-[#888ea8] font-semibold text-xs uppercase tracking-wider mr-2 flex items-center gap-1">
                     <Users className="w-3.5 h-3.5" /> Workers
                   </label>
@@ -573,11 +642,11 @@ export default function App() {
                 </div>
 
                 {scraping ? (
-                   <button type="button" onClick={stopScrape} className="btn btn-danger gap-2">
+                   <button type="button" onClick={stopScrape} className={`btn btn-danger gap-2 ${bulkMode ? 'mt-1' : ''}`}>
                      <StopCircle className="w-4 h-4" /> Stop
                    </button>
                 ) : (
-                   <button type="submit" disabled={loading} className="btn btn-primary gap-2">
+                   <button type="submit" disabled={loading} className={`btn btn-primary gap-2 ${bulkMode ? 'mt-1' : ''}`}>
                      {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />} Start
                    </button>
                 )}
@@ -591,29 +660,69 @@ export default function App() {
           </div>
         </header>
 
-        {progress.total > 0 && (
+        {(progress.total > 0 || bulkProgress.total > 0) && (
           <div className="flex-none sticky top-0 z-50 bg-white/95 dark:bg-[#0e1726]/95 backdrop-blur-sm border-b border-white-light dark:border-[#1b2e4b] px-6 py-3 shadow-sm">
-            <div className="flex justify-between items-end mb-2">
-              <div className="flex items-center gap-2">
-                {scraping ? (
-                  <><Loader2 className="w-4 h-4 text-primary animate-spin" /> <span className="font-semibold text-black dark:text-white">Scraping in progress...</span></>
-                ) : (
-                  <><CheckCircle className="w-4 h-4 text-success" /> <span className="font-semibold text-black dark:text-white">Scraping complete</span></>
-                )}
-              </div>
-              <div className="text-right">
-                <span className="font-bold text-primary mr-2">{percentage}%</span>
-                <span className="text-xs font-normal text-[#888ea8]">({progress.current.toLocaleString()} / {progress.total.toLocaleString()})</span>
-                {scraping && progress.eta > 0 && (
-                  <span className="ml-3 text-xs font-semibold text-warning bg-warning/10 px-2 py-1 rounded">
-                    {formatETA(progress.eta)}
+            {bulkProgress.total > 0 && (
+              <div className="mb-3 p-3 rounded-lg bg-primary/10 border border-primary/20">
+                <div className="flex justify-between items-center mb-1">
+                  <span className="font-semibold text-primary">
+                    Bulk Scrape Queue: {bulkProgress.current} / {bulkProgress.total}
                   </span>
+                  <span className="text-xs text-[#888ea8]">
+                    Currently scraping: {bulkProgress.current_url}
+                  </span>
+                </div>
+                <div className="w-full bg-[#ebebeb] dark:bg-[#1b2e4b] rounded-full h-2 mb-2">
+                  <div className="bg-primary h-2 rounded-full transition-all duration-300" style={{ width: `${Math.round((bulkProgress.current / bulkProgress.total) * 100)}%` }}></div>
+                </div>
+                {bulkProgress.queue && bulkProgress.queue.length > 0 && (
+                  <details className="group mt-1">
+                    <summary className="text-xs font-semibold text-primary cursor-pointer select-none list-none flex items-center gap-1 w-fit">
+                      <span className="group-open:rotate-90 transition-transform duration-200">▶</span>
+                      View Queue
+                    </summary>
+                    <div className="mt-2 max-h-40 overflow-y-auto border border-primary/20 rounded bg-white/50 dark:bg-[#0e1726]/50 p-2 text-xs shadow-inner">
+                      {bulkProgress.queue.map((qUrl, idx) => {
+                        const isDone = idx + 1 < bulkProgress.current;
+                        const isActive = qUrl === bulkProgress.current_url;
+                        return (
+                          <div key={idx} className={`py-1 px-2 rounded mb-0.5 flex justify-between ${isActive ? 'bg-primary/20 font-bold text-primary' : (isDone ? 'text-success' : 'text-[#888ea8]')}`}>
+                            <span>{idx + 1}. {qUrl}</span>
+                            <span>{isActive ? 'Scraping...' : (isDone ? 'Done' : 'Pending')}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </details>
                 )}
               </div>
-            </div>
-            <div className="w-full h-2 bg-[#ebebeb] dark:bg-[#1b2e4b] rounded-full overflow-hidden">
-              <div className={`h-full rounded-full transition-all duration-500 ${scraping ? 'bg-primary' : 'bg-success'}`} style={{ width: `${percentage}%` }}></div>
-            </div>
+            )}
+            
+            {progress.total > 0 && (
+              <>
+                <div className="flex justify-between items-end mb-2">
+                  <div className="flex items-center gap-2">
+                    {scraping ? (
+                      <><Loader2 className="w-4 h-4 text-primary animate-spin" /> <span className="font-semibold text-black dark:text-white">Scraping in progress...</span></>
+                    ) : (
+                      <><CheckCircle className="w-4 h-4 text-success" /> <span className="font-semibold text-black dark:text-white">Scraping complete</span></>
+                    )}
+                  </div>
+                  <div className="text-right">
+                    <span className="font-bold text-primary mr-2">{percentage}%</span>
+                    <span className="text-xs font-normal text-[#888ea8]">({progress.current.toLocaleString()} / {progress.total.toLocaleString()})</span>
+                    {scraping && progress.eta > 0 && (
+                      <span className="ml-3 text-xs font-semibold text-warning bg-warning/10 px-2 py-1 rounded">
+                        {formatETA(progress.eta)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="w-full h-2 bg-[#ebebeb] dark:bg-[#1b2e4b] rounded-full overflow-hidden">
+                  <div className={`h-full rounded-full transition-all duration-500 ${scraping ? 'bg-primary' : 'bg-success'}`} style={{ width: `${percentage}%` }}></div>
+                </div>
+              </>
+            )}
           </div>
         )}
 
@@ -665,7 +774,7 @@ export default function App() {
                              className="bg-transparent text-black dark:text-white font-semibold text-sm outline-none px-2 pr-3 cursor-pointer w-full lg:min-w-[260px]"
                            >
                              {sites.map(s => (
-                               <option key={s.name} value={s.name}>
+                               <option key={s.name} value={s.name} className="bg-white dark:bg-[#121e32] text-black dark:text-white">
                                  {s.name} — {s.products.toLocaleString()} products
                                </option>
                              ))}

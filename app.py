@@ -170,6 +170,37 @@ def trigger_scrape():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+@app.route('/api/scrape/bulk', methods=['POST'])
+def trigger_bulk_scrape():
+    global scraper_process
+    if scraper_process and scraper_process.poll() is None:
+        return jsonify({'status': 'error', 'message': 'Scraper already running'}), 400
+
+    req_data = request.json or {}
+    urls = req_data.get('urls')
+    workers = req_data.get('workers', 8)
+    new_version = bool(req_data.get('new_version'))
+
+    if not urls or not isinstance(urls, list) or len(urls) == 0:
+        return jsonify({'status': 'error', 'message': 'A list of URLs is required.'}), 400
+
+    queue_file = os.path.join(DATA_DIR, 'bulk_queue.txt')
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(queue_file, 'w', encoding='utf-8') as f:
+        for u in urls:
+            if u.strip():
+                f.write(u.strip() + '\n')
+
+    cmd = [VENV_PYTHON, os.path.join(BASE_DIR, 'bulk_scrape.py'), queue_file, '--workers', str(workers)]
+    if new_version:
+        cmd.append('--new-version')
+
+    try:
+        scraper_process = subprocess.Popen(cmd, cwd=BASE_DIR)
+        return jsonify({'status': 'success', 'message': 'Bulk scraping started', 'pid': scraper_process.pid})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 def append_to_scraper_log(message):
     """Write a line into scraper.log in the scraper's own format.
 
@@ -200,6 +231,13 @@ def stop_scrape():
             f"STOPPED BY USER at {done}/{total} products. Partial data was saved; "
             f"re-run the same site to resume from here.")
         logger.info(f"Scrape stopped by user at {done}/{total}")
+        # Clear bulk progress if it exists
+        try:
+            progress_file = os.path.join(DATA_DIR, 'bulk_progress.json')
+            if os.path.exists(progress_file):
+                os.remove(progress_file)
+        except:
+            pass
         return jsonify({'status': 'success', 'message': 'Scraper stopped'})
     return jsonify({'status': 'error', 'message': 'No scraper running'}), 400
 
@@ -208,6 +246,17 @@ def get_status():
     global scraper_process
     running = scraper_process is not None and scraper_process.poll() is None
     return jsonify({'running': running, 'pid': scraper_process.pid if running else None})
+
+@app.route('/api/bulk_progress', methods=['GET'])
+def get_bulk_progress():
+    progress_file = os.path.join(DATA_DIR, 'bulk_progress.json')
+    if not os.path.exists(progress_file):
+        return jsonify({'current': 0, 'total': 0, 'current_url': ''})
+    try:
+        with open(progress_file, 'r') as f:
+            return jsonify(json.load(f))
+    except:
+        return jsonify({'current': 0, 'total': 0, 'current_url': ''})
 
 # ── Scraped Sites ────────────────────────────────────────────
 def site_summary(name):

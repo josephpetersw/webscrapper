@@ -43,12 +43,18 @@
   .form-input {
     @apply w-full border border-white-light dark:border-[#17263c] bg-white dark:bg-[#121e32] text-black dark:text-white rounded-md px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-0 transition-colors;
   }
+  .form-textarea {
+    @apply w-full border border-white-light dark:border-[#17263c] bg-white dark:bg-[#121e32] text-black dark:text-white rounded-md px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-0 transition-colors resize-y;
+  }
 
   .btn {
     @apply inline-flex justify-center items-center rounded-md font-semibold transition-colors duration-300 px-5 py-2 text-sm;
   }
   .btn-primary {
     @apply bg-primary text-white hover:bg-[#344dce] shadow-[0_10px_20px_-10px_rgba(67,97,238,0.44)];
+  }
+  .btn-secondary {
+    @apply bg-secondary text-white hover:bg-[#6c48a7] shadow-[0_10px_20px_-10px_rgba(128,93,202,0.44)];
   }
   .btn-danger {
     @apply bg-danger text-white hover:bg-[#c2434b] shadow-[0_10px_20px_-10px_rgba(231,81,90,0.44)];

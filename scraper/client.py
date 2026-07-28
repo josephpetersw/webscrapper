@@ -25,6 +25,8 @@ from urllib.parse import quote, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
+from .playwright_client import fetch_playwright_async, fetch_playwright_sync, HAS_PLAYWRIGHT
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,10 @@ logger = logging.getLogger(__name__)
 # majority of stores; Safari rescues the hosts that specifically block Chrome's
 # JA3. Keep this list short — every entry is a potential extra round trip on a
 # genuinely dead URL.
-IMPERSONATE_PROFILES = ('chrome', 'safari', 'firefox')
+if HAS_PLAYWRIGHT:
+    IMPERSONATE_PROFILES = ('chrome', 'safari', 'firefox', 'playwright')
+else:
+    IMPERSONATE_PROFILES = ('chrome', 'safari', 'firefox')
 DEFAULT_PROFILE = IMPERSONATE_PROFILES[0]
 
 # Statuses where retrying — with any fingerprint — cannot help.
@@ -280,7 +285,10 @@ class ScraperClient:
             rejected_fingerprint = False
             for attempt in range(1, retries + 1):
                 try:
-                    response = self._session(profile).get(url, timeout=timeout)
+                    if profile == 'playwright':
+                        response = fetch_playwright_sync(url, timeout=timeout)
+                    else:
+                        response = self._session(profile).get(url, timeout=timeout)
                 except Exception as e:
                     last_reason = f'{type(e).__name__}: {e}'
                     outcome = 'transient'
@@ -348,7 +356,10 @@ class ScraperClient:
         blocked_reason = None
         for profile in PROFILE_MEMO.ladder(host):
             try:
-                response = self._session(profile).get(url, timeout=20)
+                if profile == 'playwright':
+                    response = fetch_playwright_sync(url, timeout=20)
+                else:
+                    response = self._session(profile).get(url, timeout=20)
             except Exception as e:
                 # A network-level failure is not a fingerprint problem; trying
                 # the rest of the ladder just triples the wait.
@@ -404,7 +415,10 @@ class ScraperClient:
             rejected_fingerprint = False
             for attempt in range(1, retries + 1):
                 try:
-                    response = await session.get(url, timeout=timeout)
+                    if profile == 'playwright':
+                        response = await fetch_playwright_async(url, timeout=timeout)
+                    else:
+                        response = await session.get(url, timeout=timeout)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
