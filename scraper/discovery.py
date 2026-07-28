@@ -69,10 +69,27 @@ PRODUCT_SITEMAP_HINTS = ('product', 'produkt')
 TAXONOMY_SITEMAP_HINTS = ('product_cat', 'product-cat', 'product_tag', 'product-tag',
                           'category', 'categories', 'product_brand', 'product-brand',
                           'brand', 'tag', 'pa_', 'attribute')
-PRODUCT_URL_HINTS = ('/product/', '/produkt/', '/products/', '/item/', '/p/')
-ARCHIVE_ROOT_PATHS = ('/shop/', '/store/', '/products/', '/shop', '/store', '/products')
+# Path segments that mark a product page. '/shop/' and '/store/' are
+# deliberately absent — they match catalogue indexes far more often.
+PRODUCT_URL_HINTS = ('/product/', '/produkt/', '/products/', '/item/', '/p/',
+                     '/catalogue/', '/catalog/', '/product-detail/', '/pd/',
+                     '/dp/', '/buy/')
+ARCHIVE_ROOT_PATHS = ('/shop/', '/store/', '/products/', '/shop', '/store', '/products',
+                      '/catalogue/', '/catalogue', '/catalog/', '/catalog')
 SITEMAP_FALLBACK_PATHS = ('/sitemap_index.xml', '/sitemap.xml', '/wp-sitemap.xml',
-                          '/product-sitemap.xml', '/sitemap.xml.gz')
+                          '/product-sitemap.xml', '/sitemap.xml.gz',
+                          '/sitemap_products_1.xml', '/pub/sitemap.xml',
+                          '/sitemap/sitemap.xml')
+
+# Files a sitemap may list that are assets, not pages worth scraping.
+_ASSET_SUFFIXES = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.svg', '.ico',
+                   '.pdf', '.zip', '.mp4', '.webm', '.mp3', '.css', '.js', '.xml')
+
+# Non-product page paths that show up in a whole-site sitemap.
+_NON_PRODUCT_PATH_TOKENS = ('/blog/', '/news/', '/author/', '/tag/', '/category/',
+                            '/page/', '/cart', '/checkout', '/my-account', '/wishlist',
+                            '/contact', '/about', '/privacy', '/terms', '/faq',
+                            '/wp-content/', '/wp-json/', '/feed')
 
 
 def base_url(url):
@@ -83,6 +100,76 @@ def base_url(url):
 def _is_archive_root(url):
     path = urlparse(url).path.rstrip('/')
     return (path or '/') in [p.rstrip('/') or '/' for p in ARCHIVE_ROOT_PATHS]
+
+
+def _is_scrapable_page(url, host=None):
+    """Filter out things a sitemap lists that are not product pages.
+
+    Sitemaps routinely include images on a separate media host, PDFs, blog
+    posts and account pages. Feeding those to the scraper wastes a request each
+    and lands them in failed_urls.json looking like real failures.
+    """
+    if not url or not url.startswith(('http://', 'https://')):
+        return False
+    parsed = urlparse(url)
+    if host and parsed.netloc.lower() != host:
+        return False
+    path = parsed.path.lower()
+    if path.endswith(_ASSET_SUFFIXES):
+        return False
+    if any(token in path for token in _NON_PRODUCT_PATH_TOKENS):
+        return False
+
+    # The homepage, and language stubs like '/zh' or '/en', turn up in product
+    # sitemaps more often than you would hope. Scraped, they become a record
+    # titled after the store itself, which then counts as "already done" on the
+    # next run. No product slug is a single segment of three characters or less.
+    segments = [s for s in path.split('/') if s]
+    if not segments or (len(segments) == 1 and len(segments[0]) <= 3):
+        return False
+
+    return not _is_archive_root(url)
+
+
+def _infer_product_urls(urls, host=None):
+    """Pick the product URLs out of a whole-site sitemap by shape.
+
+    Plenty of stores publish one undifferentiated ``sitemap.xml`` — no
+    ``product-sitemap.xml`` to key off. But a catalogue dominates such a
+    sitemap: on a Django-Oscar shop nearly every URL is ``/catalogue/<slug>/``.
+    So group the URLs by their first path segment and take the segment that
+    both looks like a product path and accounts for most of the file.
+
+    Returns [] rather than guessing when no segment dominates, so a site with a
+    genuinely flat URL scheme falls through to the other strategies instead of
+    scraping its About page.
+    """
+    pages = [u for u in urls if _is_scrapable_page(u, host)]
+    if len(pages) < 5:
+        return []
+
+    groups = {}
+    for url in pages:
+        segments = [s for s in urlparse(url).path.split('/') if s]
+        key = f"/{segments[0]}/" if segments else '/'
+        groups.setdefault(key, []).append(url)
+
+    # A known product prefix wins outright, however small its share.
+    for key, members in groups.items():
+        if key in PRODUCT_URL_HINTS and len(members) >= 5:
+            logger.info(f"Sitemap URL shape '{key}' matched a known product path "
+                        f"-> {len(members)} URL(s)")
+            return members
+
+    key, members = max(groups.items(), key=lambda kv: len(kv[1]))
+    share = len(members) / len(pages)
+    # Two-thirds of a store's pages being one shape means that shape is the
+    # catalogue. Below that it is just as likely to be a blog.
+    if share >= 0.66 and len(members) >= 20 and key != '/':
+        logger.info(f"Sitemap URL shape '{key}' is {share:.0%} of the site "
+                    f"-> treating its {len(members)} URL(s) as products")
+        return members
+    return []
 
 
 def detect_platform(html):
@@ -135,6 +222,7 @@ def _safe_json(text):
 
 def discover_via_sitemaps(client, parser, base):
     """Walk robots.txt and the conventional sitemap locations."""
+    host = urlparse(base).netloc.lower()
     queue, found_sitemaps = [], []
     robots = client.fetch_page(f"{base}/robots.txt", retries=1)
     if robots:
@@ -170,7 +258,7 @@ def discover_via_sitemaps(client, parser, base):
         name = sitemap_url.lower()
         is_product_sitemap = (any(h in name for h in PRODUCT_SITEMAP_HINTS)
                               and not any(t in name for t in TAXONOMY_SITEMAP_HINTS))
-        pages = [u for u in locs if '/wp-content/' not in u and not _is_archive_root(u)]
+        pages = [u for u in locs if _is_scrapable_page(u, host)]
         all_leaf_urls.extend(pages)
         if is_product_sitemap:
             logger.info(f"Product sitemap {sitemap_url} -> {len(pages)} product URL(s)")
@@ -178,9 +266,13 @@ def discover_via_sitemaps(client, parser, base):
 
     if from_product_sitemaps:
         return from_product_sitemaps, found_sitemaps
-    # No sitemap advertised itself as products; guess from URL shape instead.
+
+    # No sitemap advertised itself as products. Try the known product path
+    # shapes first, then fall back to inferring the shape from the sitemap.
     guessed = [u for u in all_leaf_urls if any(h in u.lower() for h in PRODUCT_URL_HINTS)]
-    return guessed, found_sitemaps
+    if guessed:
+        return guessed, found_sitemaps
+    return _infer_product_urls(all_leaf_urls, host), found_sitemaps
 
 
 def discover_via_shopify(client, base, max_pages=60):
@@ -243,17 +335,112 @@ def discover_via_wp_rest(client, base, max_pages=100):
     return urls
 
 
-def discover_via_crawl(client, base, max_pages=150):
-    """Last resort: walk listing pages and follow pagination, harvesting links.
+def discover_via_opencart(client, base, max_pages=60):
+    """OpenCart stores rarely publish a sitemap, but always have search.
 
-    Used when a store publishes no usable sitemap or API. Slower and less
-    complete than the other strategies, but it works on almost anything.
+    ``index.php?route=product/search`` with an empty-ish term and a large limit
+    pages the entire catalogue, and OpenCart's own HTML sitemap route lists
+    every category. Both are stock routes present on any default install.
     """
     from bs4 import BeautifulSoup
 
-    host = urlparse(base).netloc
-    queue = [base + p for p in ('/shop/', '/store/', '/products/', '/product-category/', '/')]
-    seen_pages, products = set(), set()
+    host = urlparse(base).netloc.lower()
+    products, seen_pages = set(), set()
+
+    # OpenCart stores are usually run with SEO URLs on, so products appear as
+    # flat slugs with no 'product_id=' anywhere. The stock listing markup is
+    # the reliable signal instead.
+    listing_selectors = ('.product-thumb a', '.product-layout a', '.product-item a',
+                         '.caption a', '.product-grid a', '.product-list a')
+
+    def harvest(html, page_url):
+        try:
+            soup = BeautifulSoup(html, 'lxml')
+        except Exception:
+            return
+        anchors = []
+        for selector in listing_selectors:
+            try:
+                anchors.extend(soup.select(selector))
+            except Exception:
+                continue
+        anchors.extend(a for a in soup.find_all('a', href=True)
+                       if 'product_id=' in a['href'] or 'route=product/product' in a['href'])
+        for anchor in anchors:
+            href = anchor.get('href')
+            if not href:
+                continue
+            href = urljoin(page_url, href.split('#')[0])
+            if urlparse(href).netloc.lower() != host:
+                continue
+            # Listing links carry the search/paging params through; strip them
+            # so the same product isn't scraped once per originating page.
+            if 'product_id=' not in href and 'route=' not in href:
+                href = href.split('?')[0]
+            if _is_scrapable_page(href, host):
+                products.add(href)
+
+    # Paged search over the whole catalogue.
+    for page in range(1, max_pages + 1):
+        url = (f"{base}/index.php?route=product/search&search=&limit=100"
+               f"&description=true&page={page}")
+        if url in seen_pages:
+            break
+        seen_pages.add(url)
+        html = client.fetch_page(url, retries=1)
+        if not html:
+            break
+        before = len(products)
+        harvest(html, url)
+        if len(products) == before:
+            break  # no new items on this page — end of the catalogue
+
+    # The stock HTML sitemap lists categories; walk them for anything missed.
+    sitemap_html = client.fetch_page(f"{base}/index.php?route=information/sitemap", retries=1)
+    if sitemap_html:
+        try:
+            soup = BeautifulSoup(sitemap_html, 'lxml')
+            categories = [urljoin(base, a['href']) for a in soup.find_all('a', href=True)
+                          if 'path=' in a['href'] or 'route=product/category' in a['href']]
+        except Exception:
+            categories = []
+        for category in categories[:max_pages]:
+            html = client.fetch_page(f"{category}&limit=100", retries=1)
+            if html:
+                harvest(html, category)
+
+    if products:
+        logger.info(f"OpenCart routes -> {len(products)} product URL(s)")
+    return sorted(products)
+
+
+def discover_via_crawl(client, base, max_pages=150):
+    """Last resort: walk the storefront itself, harvesting product links.
+
+    Used when a store publishes no usable sitemap or API. A bounded
+    breadth-first walk rather than a pagination-only follow, because plenty of
+    storefronts — anything rendering its homepage carousels in JavaScript, for
+    one — expose no product link at all until you reach a category page, and
+    their category URLs are bare slugs with nothing to pattern-match on.
+
+    Pages that look like listings are visited first so the budget is spent
+    where products actually are. If hint-matching finds nothing, the shape of
+    everything collected is inferred instead, which is what rescues stores
+    using an unusual product path.
+    """
+    from bs4 import BeautifulSoup
+
+    host = urlparse(base).netloc.lower()
+    queue = [base + p for p in ('/', '/shop/', '/store/', '/products/', '/catalogue/',
+                                '/catalog/', '/categories', '/product-category/')]
+    seen_pages, products, all_links = set(), set(), set()
+
+    def looks_like_listing(url):
+        low = url.lower()
+        return any(token in low for token in
+                   ('/page/', 'paged=', 'product-category', '/category/', '/categories',
+                    'route=product/category', '/collections/', '/shop', '/store',
+                    '/catalog', '/departments/', '/brand'))
 
     while queue and len(seen_pages) < max_pages:
         page = queue.pop(0)
@@ -270,18 +457,28 @@ def discover_via_crawl(client, base, max_pages=150):
             continue
 
         for anchor in soup.find_all('a', href=True):
-            href = urljoin(page, anchor['href'].split('#')[0])
-            if urlparse(href).netloc != host:
+            href = urljoin(page, anchor['href'].split('#')[0]).split('?')[0]
+            if urlparse(href).netloc.lower() != host:
                 continue
-            low = href.lower()
-            if any(h in low for h in PRODUCT_URL_HINTS) and not _is_archive_root(href):
+            if not _is_scrapable_page(href, host):
+                continue
+            all_links.add(href)
+            if any(h in href.lower() for h in PRODUCT_URL_HINTS):
                 products.add(href)
-            elif ('/page/' in low or 'paged=' in low or 'product-category' in low) \
-                    and href not in seen_pages and len(queue) < max_pages:
-                queue.append(href)
+            elif href not in seen_pages and len(queue) < max_pages * 2:
+                # Listings first, everything else behind them.
+                if looks_like_listing(href):
+                    queue.insert(0, href)
+                else:
+                    queue.append(href)
+
+    if not products and all_links:
+        # No recognised product path. Let the dominant URL shape decide.
+        products = set(_infer_product_urls(sorted(all_links), host))
 
     if products:
-        logger.info(f"Listing crawl -> {len(products)} product URL(s) from {len(seen_pages)} page(s)")
+        logger.info(f"Listing crawl -> {len(products)} product URL(s) "
+                    f"from {len(seen_pages)} page(s)")
     return sorted(products)
 
 
@@ -317,12 +514,17 @@ def discover_products(client, parser, url):
 
     run('sitemaps', sitemap_strategy)
 
-    if platform['id'] == 'shopify':
+    # Shopify's products.json is worth probing even when the homepage did not
+    # look like Shopify — headless and white-labelled storefronts hide every
+    # other marker but keep the endpoint.
+    if platform['id'] == 'shopify' or not platform['supported']:
         run('shopify_api', lambda: discover_via_shopify(client, base))
     if platform['id'] in ('woocommerce', 'wordpress'):
         run('woocommerce_api', lambda: discover_via_woo_store_api(client, base))
         if not strategies.get('woocommerce_api'):
             run('wp_rest_api', lambda: discover_via_wp_rest(client, base))
+    if platform['id'] == 'opencart':
+        run('opencart_routes', lambda: discover_via_opencart(client, base))
 
     deduped = list(dict.fromkeys(urls))
 
@@ -365,18 +567,36 @@ def analyze_site(client, parser, url):
         'apis': [],
         'estimated_products': None,
         'strategy': None,
+        'fingerprint': None,
         'warnings': [],
         'notes': [],
     }
 
-    homepage = client.fetch_page(base, retries=1)
+    # probe() reports *why* a host refused us, and which browser fingerprint
+    # got in — worth surfacing, because "blocked by a bot wall" and "the site
+    # is down" need completely different responses from the user.
+    attempt = client.probe(base)
+    homepage = attempt.get('html')
     if not homepage:
-        report['warnings'].append(
-            'Could not fetch the homepage. The site may be down, or blocking automated requests '
-            '(for example with an interactive Cloudflare challenge).')
+        reason = attempt.get('reason') or 'unreachable'
+        report['reason'] = reason
+        if 'challenge' in reason.lower() or 'HTTP 403' in reason:
+            report['warnings'].append(
+                'This site is behind an interactive bot challenge (Cloudflare or similar) that '
+                'cannot be solved automatically. Scraping it will not work without a real browser '
+                'session.')
+        else:
+            report['warnings'].append(
+                f'Could not fetch the homepage ({reason}). The site may be down or unreachable '
+                'from this machine.')
         return report
 
     report['reachable'] = True
+    report['fingerprint'] = attempt.get('profile')
+    if attempt.get('profile') and attempt['profile'] != 'chrome':
+        report['notes'].append(
+            f"This store rejects the default browser fingerprint; the scraper will use "
+            f"'{attempt['profile']}' for it automatically.")
     report['platform'] = detect_platform(homepage)
     report['wordpress'] = inspect_wordpress(homepage)
 
@@ -420,7 +640,9 @@ def analyze_site(client, parser, url):
         if wp is not None and wp.status_code == 200:
             report['apis'].append({'name': 'WordPress REST API', 'available': True, 'products': None})
 
-    if pid == 'shopify':
+    # Shopify's endpoint is probed even on unrecognised platforms — headless
+    # storefronts hide every other marker but keep it.
+    if pid == 'shopify' or not report['platform']['supported']:
         text = client.fetch_page(f"{base}/products.json?limit=250", retries=1)
         data = _safe_json(text) if text else None
         if isinstance(data, dict) and isinstance(data.get('products'), list):
@@ -431,21 +653,33 @@ def analyze_site(client, parser, url):
             if count < 250:
                 report['estimated_products'] = count
 
-    # Guidance for the user
+    if pid == 'opencart':
+        resp = client.fetch_response(
+            f"{base}/index.php?route=product/search&search=&limit=100")
+        if resp is not None and resp.status_code == 200:
+            report['apis'].append({'name': 'OpenCart search route', 'available': True,
+                                   'products': None})
+            report['strategy'] = report['strategy'] or 'opencart_routes'
+
+    # Guidance for the user. Product *extraction* no longer depends on the
+    # platform — it reads schema.org structured data, which every storefront
+    # publishes — so an unrecognised platform is a discovery question now,
+    # not an extraction one.
     if report['platform']['supported']:
         report['notes'].append(f"{report['platform']['name']} is fully supported.")
     elif pid == 'wordpress':
-        report['warnings'].append(
-            'WordPress detected but no store plugin was identified. Scraping will still be '
-            'attempted, but product pages may not match the expected structure.')
+        report['notes'].append(
+            'WordPress detected but no store plugin was identified. Product details will be read '
+            'from the structured data on each page.')
     elif pid != 'unknown':
-        report['warnings'].append(
-            f"{report['platform']['name']} is not explicitly supported yet. The scraper will fall "
-            f"back to sitemap and listing-page discovery, and product details may be incomplete.")
+        report['notes'].append(
+            f"{report['platform']['name']} has no dedicated discovery strategy, so product URLs "
+            f"come from sitemaps or a listing crawl. Product details are read from structured "
+            f"data and should still be complete.")
     else:
-        report['warnings'].append(
-            'Could not identify the platform. The scraper will fall back to generic sitemap and '
-            'listing-page discovery.')
+        report['notes'].append(
+            'Could not identify the platform. Product URLs will come from generic sitemap and '
+            'listing-page discovery; product details are read from structured data.')
 
     if not report['product_sitemaps'] and not report['apis']:
         report['strategy'] = 'listing_crawl'

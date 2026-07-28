@@ -18,6 +18,10 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
 
+# The single definition of a product record's fields, shared with the scraper
+# so exports can never drift from what the parser produces.
+from scraper import schema as product_schema
+
 app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
 CORS(app)
 
@@ -693,8 +697,7 @@ def export_csv():
     try:
         products = load_products_from_cache()
         output = io.StringIO()
-        fieldnames = ['title', 'brand', 'price', 'url', 'categories', 'images', 'short_description', 'long_description']
-        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
+        writer = csv.DictWriter(output, fieldnames=PRODUCT_FIELDS, extrasaction='ignore')
         writer.writeheader()
         for p in products:
             if not p.get('title'):
@@ -710,17 +713,7 @@ def export_csv():
                 short_desc = short_desc.replace('<br>', '\n')
                 long_desc = long_desc.replace('<br>', '\n')
                 
-            row = {
-                'title': p.get('title', ''),
-                'brand': p.get('brand', ''),
-                'price': p.get('price', ''),
-                'url': p.get('url', ''),
-                'categories': ' > '.join(p.get('categories', [])),
-                'images': ' | '.join(p.get('images', [])),
-                'short_description': short_desc,
-                'long_description': long_desc
-            }
-            writer.writerow(row)
+            writer.writerow(product_schema.export_row(p, short_desc, long_desc))
         output.seek(0)
         return Response(
             output.getvalue(),
@@ -756,16 +749,11 @@ def export_excel():
                 short_desc = short_desc.replace('<br>', '\n')
                 long_desc = long_desc.replace('<br>', '\n')
                 
-            data.append({
-                'Title': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', p.get('title', '')),
-                'Brand': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', p.get('brand', '')),
-                'Price': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', p.get('price', '')),
-                'URL': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', p.get('url', '')),
-                'Categories': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', ' > '.join(p.get('categories', []))),
-                'Images': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', ' | '.join(p.get('images', []))),
-                'Short Description': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', short_desc),
-                'Long Description': re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', long_desc)
-            })
+            # Excel rejects most control characters outright.
+            strip_ctrl = lambda s: re.sub(r'[\000-\010]|[\013-\014]|[\016-\037]', '', str(s))
+            row = product_schema.export_row(p, short_desc, long_desc)
+            data.append({key.replace('_', ' ').title(): strip_ctrl(value)
+                         for key, value in row.items()})
             
         df = pd.DataFrame(data)
         excel_path = os.path.join(export_workspace(), 'products.xlsx')
@@ -791,17 +779,10 @@ def export_xml():
                 if not item.get('title'): continue
                 f.write('  <product>\n')
                 
-                if is_clean:
-                    if 'short_description' in item:
-                        item['short_description'] = clean_html(item['short_description'])
-                    if 'long_description' in item:
-                        item['long_description'] = clean_html(item['long_description'])
-                        
-                for k, v in item.items():
-                    if isinstance(v, list):
-                        v = ', '.join([str(i).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;') for i in v])
-                    else:
-                        v = str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                short, long_ = _descriptions(item, is_clean)
+                row = product_schema.export_row(item, short, long_)
+                for k in PRODUCT_FIELDS:
+                    v = str(row.get(k, '')).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                     f.write(f'    <{k}>{v}</{k}>\n')
                 f.write('  </product>\n')
             f.write('</products>')
@@ -874,8 +855,9 @@ def export_structured_images():
 # The builders below take a product list rather than reading the active site,
 # so one request can export any combination of sites and formats.
 
-PRODUCT_FIELDS = ['title', 'brand', 'price', 'url', 'categories', 'images',
-                  'short_description', 'long_description']
+# The field list is defined once, in scraper/schema.py, so the scraper and
+# every exporter cannot drift apart. Do not re-declare it here.
+PRODUCT_FIELDS = product_schema.EXPORT_FIELDS
 
 def _descriptions(product, clean):
     short = product.get('short_description', '') or ''
@@ -889,13 +871,7 @@ def _rows(products, clean):
         if not p.get('title'):
             continue
         short, long_ = _descriptions(p, clean)
-        yield {
-            'title': p.get('title', ''), 'brand': p.get('brand', ''),
-            'price': p.get('price', ''), 'url': p.get('url', ''),
-            'categories': ' > '.join(p.get('categories', [])),
-            'images': ' | '.join(p.get('images', [])),
-            'short_description': short, 'long_description': long_,
-        }
+        yield product_schema.export_row(p, short, long_)
 
 def build_json(products, clean):
     data = []
@@ -924,17 +900,15 @@ def build_excel(products, clean):
     return buffer.getvalue()
 
 def build_xml(products, clean):
+    # Serialises the declared export fields only. Iterating whatever keys the
+    # record happened to carry meant a new parser field landed in the feed
+    # unannounced — a dict-valued one as a Python repr inside a tag.
     esc = lambda v: str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     parts = ['<?xml version="1.0" encoding="UTF-8"?>\n<products>\n']
-    for p in products:
-        if not p.get('title'):
-            continue
-        item = dict(p)
-        item['short_description'], item['long_description'] = _descriptions(p, clean)
+    for row in _rows(products, clean):
         parts.append('  <product>\n')
-        for key, value in item.items():
-            value = ', '.join(esc(v) for v in value) if isinstance(value, list) else esc(value)
-            parts.append(f'    <{key}>{value}</{key}>\n')
+        for key in PRODUCT_FIELDS:
+            parts.append(f'    <{key}>{esc(row.get(key, ""))}</{key}>\n')
         parts.append('  </product>\n')
     parts.append('</products>')
     return ''.join(parts).encode('utf-8')

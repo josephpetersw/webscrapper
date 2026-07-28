@@ -1,65 +1,62 @@
 import asyncio
 import os
-import re
 import aiofiles
-from urllib.parse import unquote, urlparse
 from curl_cffi.requests import AsyncSession
 import logging
 
+# Path safety lives in one module, shared with the scraper - the room left for
+# an image filename depends on the directory the scraper picked for the product.
+from .paths import MAX_FILENAME_LEN, image_path, safe_filename  # noqa: F401
+
 logger = logging.getLogger(__name__)
-
-# Characters Windows refuses in a filename, plus control codes.
-_ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_NON_PRINTABLE = re.compile(r'[^\x20-\x7e]')
-MAX_FILENAME_LEN = 100
-
-
-def safe_filename(url, fallback='image'):
-    """Turn an image URL into a filename the filesystem will actually accept.
-
-    Source URLs routinely contain percent-encoding, non-ASCII characters and
-    query strings, any of which make open() fail on Windows - which silently
-    cost us the image.
-    """
-    raw = unquote(urlparse(url).path.split('/')[-1])
-    name = _NON_PRINTABLE.sub('_', _ILLEGAL_FILENAME_CHARS.sub('_', raw)).strip('. ')
-    if not name:
-        return fallback
-    if len(name) > MAX_FILENAME_LEN:
-        stem, dot, ext = name.rpartition('.')
-        if dot and len(ext) <= 5:
-            name = stem[:MAX_FILENAME_LEN - len(ext) - 1] + '.' + ext
-        else:
-            name = name[:MAX_FILENAME_LEN]
-    return name
 
 
 class ImageDownloader:
-    def __init__(self, base_dir, concurrency=10):
+    def __init__(self, base_dir, concurrency=10, client=None):
         self.base_dir = base_dir
         self.semaphore = asyncio.Semaphore(concurrency)
+        # Images sit on the same host as the pages, so a host that rejects our
+        # browser fingerprint rejects them too. Going through the shared client
+        # means downloads use whichever fingerprint already worked for that
+        # host; without it a store could scrape perfectly and yield no pictures.
+        self.client = client
         # Ensure base image directory exists
         os.makedirs(self.base_dir, exist_ok=True)
 
     async def download_image(self, session, url, save_dir):
         os.makedirs(save_dir, exist_ok=True)
 
-        file_name = safe_filename(url)
-        file_path = os.path.join(save_dir, file_name)
+        # Shortened to whatever the path budget allows, so a long filename
+        # under a deep category tree cannot push the total past the OS limit.
+        file_path = image_path(save_dir, url)
+        if not file_path:
+            logger.warning(f"Skipping image {url}: no room left in the path budget "
+                           f"under {save_dir}")
+            return None
 
         if os.path.exists(file_path):
             return file_path  # Already downloaded
 
         async with self.semaphore:
             try:
-                response = await session.get(url, timeout=30)
-                if response.status_code == 200:
-                    async with aiofiles.open(file_path, 'wb') as f:
-                        await f.write(response.content)
-                    return file_path
+                if self.client is not None:
+                    content, reason = await self.client.fetch_bytes_async(session, url)
+                    if content is None:
+                        logger.error(f"Failed to download image {url}: {reason}")
+                        return None
                 else:
-                    logger.error(f"Failed to download image {url}: HTTP {response.status_code}")
-                    return None
+                    response = await session.get(url, timeout=30)
+                    if response.status_code != 200:
+                        logger.error(f"Failed to download image {url}: "
+                                     f"HTTP {response.status_code}")
+                        return None
+                    content = response.content
+
+                async with aiofiles.open(file_path, 'wb') as f:
+                    await f.write(content)
+                return file_path
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error downloading {url}: {e}")
                 return None

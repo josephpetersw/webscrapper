@@ -38,24 +38,98 @@ GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
 
 **Scraper** — `main.py` + `scraper/` package
 - `scraper/client.py` — `ScraperClient`: sync and async page fetchers via
-  `curl_cffi`, Chrome impersonation, 30s timeout. Retries transient failures
-  3× with linear backoff; statuses in `PERMANENT_STATUSES` (404, 403, 410, …)
-  short-circuit immediately since retrying can't help. Never raises — the
-  sync `fetch_page` returns `None`, the async `fetch_page_async` returns
-  `(None, reason)` so callers can record *why* a URL was missed.
+  `curl_cffi`. Never raises — the sync `fetch_page` returns `None`, the async
+  `fetch_page_async` returns `(None, reason)` so callers can record *why* a URL
+  was missed.
+
+  **Browser-fingerprint escalation is the important part here.** A single
+  hardcoded `impersonate="chrome"` silently loses whole stores: several hosts
+  (anything behind the `hcdn` edge) answer Chrome's TLS/JA3 fingerprint with a
+  403 "Checking your browser" interstitial and serve the identical request
+  happily under Safari. So a fetch walks `IMPERSONATE_PROFILES`
+  (chrome → safari → firefox), and `PROFILE_MEMO` remembers the first profile
+  that worked **per host**, so the cost is paid once per host rather than once
+  per URL. Consequences worth knowing:
+    - **403 is deliberately NOT in `PERMANENT_STATUSES`.** It signals a
+      fingerprint block far more often than a genuinely forbidden resource.
+      Putting it back makes every `hcdn`-fronted store fail instantly again.
+    - `looks_like_challenge()` catches bot walls that answer **200** with an
+      interstitial; without it those get parsed as if they were products.
+    - After `_EXHAUSTED_AFTER` (3) URLs on a host fail *every* profile, the
+      ladder collapses to one profile for that host. Without this, a genuinely
+      blocked site turns a 3,000-URL run into 27,000 requests.
+    - Only a *fingerprint* rejection counts towards that — a timeout says
+      nothing about which browser we look like. Hence `record_failure(blocked=)`.
+    - `normalize_url()` percent-encodes non-ASCII paths; Shopify handles
+      routinely contain `®`/`™` and curl rejects them raw.
+- `scraper/extractors.py` — platform-neutral readers for schema.org JSON-LD,
+  Open Graph meta tags and microdata, plus price/entity normalisation. No I/O,
+  never raises. `jsonld_nodes()` flattens `@graph` and `mainEntity` nesting and
+  tolerates the ways real sites break JSON-LD (CDATA wrappers, HTML comments,
+  trailing commas).
+- `scraper/schema.py` — **the single definition of a product record.**
+  `CORE_FIELDS` (the original eight) + `DETAIL_FIELDS` (`price_value`,
+  `currency`, `sku`, `availability`, `in_stock`), with `extracted_by` marked
+  diagnostic and never exported. `normalize()` guarantees types;
+  `export_row()` flattens to strings. **`app.py` imports this** — adding a
+  field is a one-line change here, and it is no longer possible to forget an
+  exporter. (The XML exporter used to serialise whatever keys a record
+  happened to carry, so a new dict-valued field landed in the feed as a Python
+  repr inside a tag.)
 - `scraper/parser.py` — `Parser`: pure static methods, no I/O. Parses sitemap
-  XML for `<loc>` URLs, and parses a WooCommerce product page's HTML into a
-  dict (title, short/long description, categories via breadcrumbs, brand
-  inferred from the last breadcrumb category or first word of the title,
-  images from the gallery wrapper, price). **This is the single most
-  fragile part of the project** — it keys off standard WooCommerce class names
-  (`product_title`, `woocommerce-product-details__short-description`,
-  `tab-description`, `.woocommerce-product-gallery__wrapper`), so it works
-  across most WooCommerce stores but breaks on heavily customised themes. If a
-  scrape returns products with empty titles, this is the first place to look.
+  XML for `<loc>` URLs, and parses a product page into a record.
+
+  **Extraction is layered, ordered by how universal each layer is:**
+  schema.org structured data (JSON-LD, then microdata) → Open Graph meta tags
+  → theme CSS selectors. Each field independently takes the first layer that
+  yields a value, so a store publishing half its data as JSON-LD and the rest
+  only in markup still comes out complete.
+
+  This ordering is the whole point: the parser used to key *only* off default
+  WooCommerce class names, which returned an empty record on Shopify,
+  Django-Oscar, Magento, Next.js storefronts and any customised Woo theme —
+  every one of which publishes schema.org data because Google rich results
+  depend on it. Selector tables (`TITLE_SELECTORS`, `PRICE_SELECTORS`, …) are
+  now the *fallback*, which is why it is safe for them to be broad.
+
+  `extracted_by` on each record names the layer that won per field — the
+  fastest way to tell "this store needs new selectors" from "this store
+  blocked us". Check it first when a scrape looks wrong.
+
+  Traps already handled, easy to reintroduce:
+    - The last breadcrumb is the product itself; left in, it becomes a
+      category, and then a directory per product in `structured/`.
+    - JSON-LD payloads are full of HTML entities (`Home &amp; Living`) — hence
+      `extractors.unescape`, applied twice for `&amp;amp;`.
+    - Stores that put their **own name** in the JSON-LD `brand` field collapse
+      the whole catalogue to one brand, so a brand matching the site's domain
+      is rejected and the next layer gets a turn.
+    - Galleries contain placeholders, spacers and trust badges (`_JUNK_IMAGE_TOKENS`),
+      and lazy-loading themes hide the real URL in one of ~10 `data-*`
+      attributes or the largest `srcset` candidate.
 - `scraper/downloader.py` — `ImageDownloader`: async image downloads with a
   semaphore for concurrency control, skips files that already exist on disk
-  (resumable).
+  (resumable). **It takes the shared `ScraperClient`** and fetches through
+  `fetch_bytes_async`, so images use whichever browser fingerprint works for
+  that host. Downloading them over a separate hardcoded-Chrome session meant a
+  fingerprint-blocked store scraped perfectly and yielded *none* of its
+  pictures — the product pages escalated to Safari, the images did not.
+- `scraper/paths.py` — **all filesystem-name safety, in one place**, because
+  the scraper and the downloader have to agree: how long an image filename may
+  be depends on the directory the scraper chose for the product.
+  - Sanitising each segment is not enough; the limit is on the **total** path.
+    `build_product_dir()` budgets the whole thing, dropping the deepest
+    category first (losing "Switches" hurts less than losing the product's
+    identity) and only then squeezing the product folder. `image_path()`
+    fits the filename into whatever room is left, returning `''` when even a
+    minimal name will not fit so the caller skips rather than fails on open().
+  - **Truncation always appends a short hash.** Two long titles sharing a
+    prefix ("… 4GB 128GB Black" / "… 8GB 256GB Blue") would otherwise collapse
+    onto one directory and overwrite each other.
+  - Windows reserved names (`CON`, `PRN`, `LPT1`, …) are escaped.
+  - `MAX_PATH` is enforced on every platform, not just Windows: `data/` gets
+    copied to and served from Windows machines, so a tree that only works on
+    Linux is a trap.
 - `main.py` — orchestrates: discover product URLs → scrape concurrently with
   `asyncio` + a `Semaphore(workers)` → write
   `data/<site>/structured/<category>/<product>/` with `data.json`,
@@ -77,10 +151,9 @@ GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
     - `write_json_atomic()` (temp file + `os.replace`) — these files are
       rewritten every few seconds while the dashboard polls them; writing in
       place lets a reader parse a half-written file.
-    - `safe_path_segment()` and `downloader.safe_filename()` — titles and
-      image URLs go straight into paths. Windows caps paths at 260 chars and
-      rejects a set of characters outright; unsanitised names silently lose
-      images and whole products.
+    - `scraper/paths.py` — titles and image URLs go straight into paths.
+      Windows caps paths at 260 chars and rejects a set of characters
+      outright; unsanitised names silently lose images and whole products.
     - A manual stop is logged to `scraper.log` by `app.py`'s stop endpoint, so
       a stopped run is distinguishable from a crash after the fact.
 
@@ -106,6 +179,28 @@ GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
       — they match catalogue indexes far more often than products.
     - WordPress theme/plugin names are parsed from asset URLs with a strict
       slug charset; a loose pattern picks up `*` and template placeholders.
+    - `_is_scrapable_page()` drops what sitemaps list alongside products:
+      images on a media host, PDFs, blog and account pages, off-host URLs —
+      and **the site root**, which appears in product sitemaps more often than
+      you would hope. Scraped, the homepage becomes a record titled after the
+      store, which then counts as "already done" on every later run.
+    - `_infer_product_urls()` handles stores publishing one undifferentiated
+      `sitemap.xml` with no `product-sitemap.xml` to key off: it groups URLs by
+      first path segment and takes the segment that both looks like a product
+      path and dominates the file (≥66%). It returns `[]` rather than guessing
+      when nothing dominates, so a flat-URL site falls through to the other
+      strategies instead of scraping its About page.
+    - OpenCart stores are usually run with SEO URLs on, so products carry no
+      `product_id=` anywhere — `discover_via_opencart` harvests the stock
+      listing markup (`.product-thumb a`, `.product-layout a`, …) via the
+      `product/search` route, and strips the paging params off each link so the
+      same product isn't scraped once per originating page.
+    - `discover_via_crawl` is a bounded BFS, not a pagination-only follow:
+      storefronts that render their homepage in JavaScript expose no product
+      link until you reach a category page, and their category URLs are bare
+      slugs with nothing to pattern-match on. Listing-looking pages are
+      visited first; if hint-matching finds nothing, the dominant shape of
+      everything collected is inferred instead.
 
   **Resume** is on by default: `load_existing_products()` reads the previous
   `products.json` and skips URLs already scraped, so a re-run fills in only
@@ -281,7 +376,19 @@ computed class name, when adding a new service or status.
    the repo root are ad hoc manual scripts (no test runner, no assertions
    framework) — run directly with the venv's Python for spot-checking parser
    output, not part of any CI.
-4. No automated test suite / CI exists in this repo at all.
+4. No CI exists. There are two self-contained, offline, no-dependency suites —
+   run them after any change to the scraper or the exporters:
+   ```bash
+   ./venv/Scripts/python.exe test_robustness.py   # parsing, path budget, discovery filters
+   ./venv/Scripts/python.exe test_exports.py      # schema + all four export builders
+   ```
+   `test_robustness.py` covers the hostile inputs real stores produce
+   (truncated JSON-LD, entity-encoded names, price ranges, galleries of
+   tracking pixels) and asserts the parser never raises. `test_exports.py`
+   feeds every builder a current record, a **legacy** record with none of the
+   new fields, and a junk record with wrong types — the legacy case is what
+   guarantees `products.json` files scraped by an older version still export.
+   Neither makes a network request, so both run in about a second.
 5. `pyrightconfig.json` points Pyright at `./venv` — if you recreate the venv
    elsewhere this needs to match.
 

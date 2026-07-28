@@ -4,7 +4,7 @@
 ![Python Version](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![React Version](https://img.shields.io/badge/React-18.x-61dafb)
 
-A robust, concurrent, UI-driven scraper for WordPress/WooCommerce storefronts. Point it at any store URL and it discovers the entire catalogue from the site's sitemaps, handles Cloudflare's browser fingerprint checks, and presents a responsive dashboard to manage, monitor, browse and export the scraped data. Each store is kept in its own folder, so you can scrape as many as you like side by side.
+A robust, concurrent, UI-driven scraper for e-commerce storefronts — WooCommerce, Shopify, Magento, OpenCart, Django-Oscar or bespoke. Point it at any store URL and it discovers the entire catalogue from sitemaps, platform APIs or a listing crawl, reads each product from its schema.org structured data, works around browser-fingerprint blocks, and presents a responsive dashboard to manage, monitor, browse and export the scraped data. Each store is kept in its own folder, so you can scrape as many as you like side by side.
 
 ---
 ![alt text](image.png)
@@ -29,8 +29,9 @@ A robust, concurrent, UI-driven scraper for WordPress/WooCommerce storefronts. P
 
 ## ✨ Key Features
 
-- **Works On Any Store**: Give it any URL on a WordPress/WooCommerce site and it finds the whole catalogue via `robots.txt` and the site's sitemaps — no per-site configuration.
-- **Smart Bot Evasion**: Passes Cloudflare's browser fingerprint checks using `curl_cffi` by mimicking legitimate browser TLS fingerprints. (Sites presenting an interactive challenge are not supported.)
+- **Works On Any Store**: Give it any store URL and it finds the whole catalogue — no per-site configuration. Discovery layers sitemaps, platform APIs (WooCommerce Store API, WP REST, Shopify `products.json`, OpenCart routes) and a bounded listing crawl, and **merges** the results rather than stopping at the first hit.
+- **Platform-Neutral Extraction**: Product details are read from schema.org structured data (JSON-LD, then microdata) first, Open Graph meta tags second, and theme CSS selectors only as a fallback. Every storefront that wants Google rich results publishes structured data, so extraction works the same on Shopify, Magento, Django-Oscar and heavily customised WooCommerce themes. Each record carries an `extracted_by` map naming the layer that produced each field.
+- **Smart Bot Evasion**: Impersonates real browser TLS fingerprints via `curl_cffi`, and **escalates through several browser profiles** when a host rejects the default — many hosts serve Chrome a 403 interstitial but answer Safari normally. The working profile is remembered per host. (Sites presenting an interactive JavaScript challenge remain unsupported, and are reported as such rather than retried.)
 - **High-Speed Concurrent Scraping**: Downloads product pages and images rapidly using asynchronous tasks (with configurable worker limits).
 - **Resumable & Verifiable**: Failed URLs are retried with backoff, recorded to `failed_urls.json`, and re-running skips what's already saved — so an interrupted scrape picks up where it left off.
 - **One Folder Per Store**: Each site lands in `data/<domain>/`, and re-scraping asks whether to update in place or keep the old copy as a timestamped version.

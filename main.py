@@ -12,6 +12,7 @@ from scraper.client import ScraperClient
 from scraper.parser import Parser
 from scraper.downloader import ImageDownloader
 from scraper import discovery
+from scraper import paths as paths_util
 
 # Setup logging to both console and file
 logger = logging.getLogger(__name__)
@@ -153,16 +154,10 @@ def mark_completed(state, url, note):
         save_results(state)
 
 
-def safe_path_segment(value, max_len=60):
-    """Filesystem-safe, length-capped folder name.
-
-    Product titles and category names go straight into the directory tree, and
-    Windows still caps a full path at 260 characters by default - long titles
-    nested under a few categories will blow past that and every write for that
-    product fails.
-    """
-    cleaned = re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9]', '_', value or '')).strip('_')
-    return cleaned[:max_len].strip('_') or 'unnamed'
+# Path safety (segment sanitising and the whole-path budget) lives in
+# scraper/paths.py so the scraper and the image downloader cannot disagree
+# about how much room is left. Re-exported here for backwards compatibility.
+safe_path_segment = paths_util.safe_path_segment
 
 
 async def scrape_product(url, async_session, parser, downloader, semaphore, state):
@@ -195,13 +190,10 @@ async def _scrape_product_inner(url, async_session, parser, downloader, semaphor
             mark_completed(state, url, 'No data')
             return None
 
-        # Determine primary category path
-        cats = data.get('categories', [])
-        cat_path = os.path.join(*[safe_path_segment(c, 40) for c in cats]) if cats else "Uncategorized"
-
-        safe_name = safe_path_segment(data.get('title') or url.rstrip('/').split('/')[-1])
-
-        structured_dir = os.path.join(state['paths']['structured'], cat_path, safe_name)
+        # Category trail + product folder, budgeted so there is still room for
+        # the image filenames underneath it.
+        structured_dir = paths_util.build_product_dir(
+            state['paths']['structured'], data.get('categories'), data.get('title'), url)
         os.makedirs(structured_dir, exist_ok=True)
 
         # Save descriptions
@@ -240,8 +232,12 @@ async def _scrape_product_inner(url, async_session, parser, downloader, semaphor
 
 async def run_concurrent_scraper(product_urls, workers, paths, existing_products=None):
     parser = Parser()
-    # Concurrency limit for image downloads
-    downloader = ImageDownloader(base_dir=paths['images'], concurrency=workers)
+    client = ScraperClient()
+    # Concurrency limit for image downloads. The downloader shares the client so
+    # images are fetched with whichever browser fingerprint works for the host -
+    # otherwise a store scrapes fine and comes back with none of its pictures.
+    downloader = ImageDownloader(base_dir=paths['images'], concurrency=workers,
+                                 client=client)
     # Concurrency limit for product page fetching
     semaphore = asyncio.Semaphore(workers)
 
@@ -252,7 +248,7 @@ async def run_concurrent_scraper(product_urls, workers, paths, existing_products
         'products': list(existing_products),
         'categories': set(),
         'failed': [],
-        'client': ScraperClient(),
+        'client': client,
         'paths': paths,
         'start_time': time.time(),
     }
@@ -275,6 +271,13 @@ async def run_concurrent_scraper(product_urls, workers, paths, existing_products
         logger.warning("Scrape cancelled - saving what was collected so far.")
     except Exception as e:
         logger.error(f"Scrape loop aborted ({type(e).__name__}: {e}) - saving partial results.")
+    finally:
+        # The client opens its own sessions when a host needs a non-default
+        # browser fingerprint; those are not covered by the block above.
+        try:
+            await state['client'].aclose()
+        except Exception:
+            pass
 
     save_results(state)
 

@@ -1,42 +1,327 @@
+"""HTTP fetching, with automatic browser-fingerprint escalation.
+
+``curl_cffi`` impersonates a real browser's TLS/HTTP2 fingerprint, which is what
+gets us past most bot protection. But a *single* hardcoded profile is not
+enough: several hosts (anything behind the ``hcdn`` edge, for one) reject the
+Chrome fingerprint with a 403 "Checking your browser" interstitial while
+serving the identical request happily under Safari. That is a fingerprint
+mismatch, not a permanent refusal — treating it as one silently loses whole
+stores.
+
+So every fetch walks a short ladder of profiles, and the first profile that
+works for a host is remembered and reused for every later request to it. The
+cost of discovery is paid once per host, not once per URL.
+
+Nothing here raises. ``fetch_page`` returns ``None`` and ``fetch_page_async``
+returns ``(None, reason)`` so callers can record *why* a URL was missed.
+"""
+
 import asyncio
-import time
-from curl_cffi import requests
-from bs4 import BeautifulSoup
 import logging
+import threading
+import time
+from urllib.parse import quote, urlparse, urlunparse
+
+from bs4 import BeautifulSoup
+from curl_cffi import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Status codes where retrying cannot help — the resource is simply not there.
-PERMANENT_STATUSES = (400, 401, 403, 404, 410, 451)
+# Fingerprints to try, in order. Chrome first because it works on the large
+# majority of stores; Safari rescues the hosts that specifically block Chrome's
+# JA3. Keep this list short — every entry is a potential extra round trip on a
+# genuinely dead URL.
+IMPERSONATE_PROFILES = ('chrome', 'safari', 'firefox')
+DEFAULT_PROFILE = IMPERSONATE_PROFILES[0]
+
+# Statuses where retrying — with any fingerprint — cannot help.
+# 403 is deliberately NOT here: it is the signature of a fingerprint block far
+# more often than of a genuinely forbidden resource, so it escalates instead.
+PERMANENT_STATUSES = (400, 401, 404, 410, 451)
+
+# Statuses that mean "try a different browser fingerprint".
+FINGERPRINT_STATUSES = (403, 406, 429, 503)
 
 DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF = 2.0
+DEFAULT_TIMEOUT = 30
+
+# Bot walls that answer 200 with an interstitial instead of the page. Checked
+# against the first few KB only — these pages are always tiny and front-loaded.
+_CHALLENGE_MARKERS = (
+    'just a moment...',
+    'checking your browser',
+    'enable javascript and cookies to continue',
+    'cf-browser-verification',
+    'challenge-platform',
+    '_incapsula_resource',
+    'ddos-guard',
+)
+_CHALLENGE_SNIFF_BYTES = 4000
+# Below this, a "successful" HTML response is almost certainly an error or
+# interstitial rather than a real page.
+_MIN_CREDIBLE_HTML = 200
+
+
+def looks_like_challenge(text, headers=None):
+    """True if this response is a bot-wall interstitial rather than content."""
+    if headers:
+        try:
+            if str(headers.get('cf-mitigated', '')).lower() == 'challenge':
+                return True
+        except Exception:
+            pass
+    if not text:
+        return False
+    head = text[:_CHALLENGE_SNIFF_BYTES].lower()
+    return any(marker in head for marker in _CHALLENGE_MARKERS)
+
+
+def normalize_url(url):
+    """Percent-encode a URL so curl accepts it.
+
+    Product URLs regularly contain non-ASCII characters (registered-trademark
+    signs in Shopify handles, for instance) and raw spaces. Left alone these
+    either raise or fetch the wrong resource.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlparse(url.strip())
+        return urlunparse((
+            parts.scheme,
+            parts.netloc.encode('idna').decode('ascii') if _non_ascii(parts.netloc) else parts.netloc,
+            quote(parts.path, safe="/%:@&=+$,~!*'()"),
+            quote(parts.params, safe="/%:@&=+$,~"),
+            quote(parts.query, safe="/%:@&=+$,~?"),
+            parts.fragment,
+        ))
+    except Exception:
+        return url
+
+
+def _non_ascii(value):
+    return any(ord(c) > 127 for c in value or '')
+
+
+def _host_of(url):
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ''
+
+
+# After this many URLs on a host have failed the whole ladder, stop walking it.
+# Escalation is worth paying for once per host; paying for it on every URL of a
+# host that is simply blocking us turns a 3,000-product run into 27,000 requests.
+_EXHAUSTED_AFTER = 3
+
+
+class _ProfileMemo:
+    """Remembers which fingerprint works for each host, and which are hopeless.
+
+    Shared across every ScraperClient in the process so the discovery pass and
+    the scrape pass don't each pay for the same escalation.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._good = {}
+        self._failures = {}
+        self._announced = set()
+
+    def get(self, host):
+        with self._lock:
+            return self._good.get(host)
+
+    def set(self, host, profile):
+        if not host:
+            return
+        with self._lock:
+            self._failures.pop(host, None)
+            if self._good.get(host) != profile:
+                self._good[host] = profile
+                if profile != DEFAULT_PROFILE:
+                    logger.info(f"Using '{profile}' browser fingerprint for {host}")
+
+    def record_failure(self, host, blocked=False):
+        """Note that every profile failed for a URL on this host.
+
+        Only a *fingerprint* rejection counts towards giving up on escalation.
+        A timeout or a flaky 500 says nothing about which browser we look like,
+        and must not train us out of trying alternates.
+        """
+        if not host or not blocked:
+            return
+        with self._lock:
+            count = self._failures.get(host, 0) + 1
+            self._failures[host] = count
+            if count == _EXHAUSTED_AFTER and host not in self._announced:
+                self._announced.add(host)
+                logger.warning(
+                    f"{host} rejected every browser fingerprint on {count} URLs - "
+                    f"no longer retrying alternates for it. The host is most likely behind "
+                    f"an interactive bot challenge.")
+
+    def is_exhausted(self, host):
+        with self._lock:
+            return self._failures.get(host, 0) >= _EXHAUSTED_AFTER
+
+    def ladder(self, host):
+        """Profiles to try for this host, best-known first."""
+        known = self.get(host)
+        if known:
+            return [known] + [p for p in IMPERSONATE_PROFILES if p != known]
+        if self.is_exhausted(host):
+            # Still try — the block may lift — but at the cost of one profile,
+            # not the whole ladder.
+            return [DEFAULT_PROFILE]
+        return list(IMPERSONATE_PROFILES)
+
+
+PROFILE_MEMO = _ProfileMemo()
+
 
 class ScraperClient:
     def __init__(self):
-        # We use impersonate="chrome" to bypass Cloudflare
-        self.session = requests.Session(impersonate="chrome")
+        # One session per fingerprint, created on first use. Sessions are
+        # cheap to hold and expensive to recreate per request (connection
+        # reuse is most of the speed on a few-thousand-URL run).
+        self._sessions = {}
+        self._async_sessions = {}
+        self._lock = threading.Lock()
+
+    # ── session management ───────────────────────────────────────────────
+
+    def _session(self, profile):
+        with self._lock:
+            session = self._sessions.get(profile)
+            if session is None:
+                session = requests.Session(impersonate=profile)
+                self._sessions[profile] = session
+            return session
+
+    def _async_session(self, profile, preferred=None):
+        """Async session for a profile.
+
+        ``preferred`` is the session the caller already opened (main.py owns
+        one for the default profile and shares it with the image downloader);
+        reusing it avoids opening a second connection pool for the common case.
+        """
+        if preferred is not None and profile == DEFAULT_PROFILE:
+            return preferred
+        session = self._async_sessions.get(profile)
+        if session is None:
+            session = requests.AsyncSession(impersonate=profile)
+            self._async_sessions[profile] = session
+        return session
+
+    async def aclose(self):
+        """Close any async sessions this client opened itself."""
+        for session in list(self._async_sessions.values()):
+            try:
+                await session.close()
+            except Exception:
+                pass
+        self._async_sessions.clear()
+
+    def close(self):
+        for session in list(self._sessions.values()):
+            try:
+                session.close()
+            except Exception:
+                pass
+        self._sessions.clear()
+
+    # ── response classification ──────────────────────────────────────────
+
+    @staticmethod
+    def _classify(response, binary=False):
+        """(outcome, reason) for a response.
+
+        outcome is 'ok' | 'permanent' | 'fingerprint' | 'transient'.
+        ``binary`` skips the text-body checks — decoding an image as text to
+        look for a challenge marker is both wasteful and meaningless.
+        """
+        status = response.status_code
+        if status == 200:
+            if binary:
+                return ('ok', None) if response.content else ('transient', 'empty response body')
+            text = response.text
+            if looks_like_challenge(text, response.headers):
+                return 'fingerprint', 'bot challenge page'
+            if not text:
+                return 'transient', 'empty response body'
+            # A short body is only suspicious for HTML. Plenty of API and
+            # sitemap endpoints legitimately answer with a few bytes, and
+            # retrying those wastes nine requests to learn nothing.
+            content_type = str(response.headers.get('content-type', '')).lower()
+            if 'html' in content_type and len(text) < _MIN_CREDIBLE_HTML:
+                return 'transient', f'suspiciously short HTML ({len(text)} bytes)'
+            return 'ok', None
+        reason = f'HTTP {status}'
+        if status in PERMANENT_STATUSES:
+            return 'permanent', reason
+        if status in FINGERPRINT_STATUSES:
+            return 'fingerprint', reason
+        return 'transient', reason
+
+    # ── sync ─────────────────────────────────────────────────────────────
+
+    def fetch(self, url, retries=DEFAULT_RETRIES, backoff=DEFAULT_BACKOFF,
+              timeout=DEFAULT_TIMEOUT):
+        """Fetch a URL, escalating fingerprints as needed. Returns (response, reason)."""
+        url = normalize_url(url)
+        host = _host_of(url)
+        last_reason = 'unknown error'
+        blocked = False
+
+        for profile in PROFILE_MEMO.ladder(host):
+            rejected_fingerprint = False
+            for attempt in range(1, retries + 1):
+                try:
+                    response = self._session(profile).get(url, timeout=timeout)
+                except Exception as e:
+                    last_reason = f'{type(e).__name__}: {e}'
+                    outcome = 'transient'
+                else:
+                    outcome, reason = self._classify(response)
+                    if outcome == 'ok':
+                        PROFILE_MEMO.set(host, profile)
+                        return response, None
+                    last_reason = reason or last_reason
+                    if outcome == 'permanent':
+                        logger.debug(f"Not retrying {url}: {last_reason}")
+                        return None, last_reason
+                    if outcome == 'fingerprint':
+                        rejected_fingerprint = blocked = True
+                        break  # a different browser profile is the only thing that helps
+
+                if attempt < retries:
+                    delay = backoff * attempt
+                    logger.debug(f"Attempt {attempt}/{retries} failed for {url} "
+                                 f"({last_reason}) — retrying in {delay:.0f}s")
+                    time.sleep(delay)
+
+            if not rejected_fingerprint:
+                # Timeouts, DNS and connection errors say nothing about which
+                # browser we look like. Walking the rest of the ladder would
+                # triple the wait on an unresponsive host for no chance of
+                # success.
+                break
+
+        PROFILE_MEMO.record_failure(host, blocked=blocked)
+        logger.debug(f"Giving up on {url}: {last_reason}")
+        return None, last_reason
 
     def fetch_page(self, url, retries=DEFAULT_RETRIES, backoff=DEFAULT_BACKOFF):
-        last_reason = 'unknown error'
-        for attempt in range(1, retries + 1):
-            try:
-                response = self.session.get(url, timeout=30)
-                if response.status_code == 200:
-                    return response.text
-                last_reason = f"HTTP {response.status_code}"
-                if response.status_code in PERMANENT_STATUSES:
-                    logger.error(f"Failed to fetch {url}: {last_reason} (not retrying)")
-                    return None
-            except Exception as e:
-                last_reason = str(e)
-            if attempt < retries:
-                delay = backoff * attempt
-                logger.warning(f"Attempt {attempt}/{retries} failed for {url} ({last_reason}) — retrying in {delay:.0f}s")
-                time.sleep(delay)
-        logger.error(f"Giving up on {url} after {retries} attempts: {last_reason}")
-        return None
+        """Page body, or None if every fingerprint and retry failed."""
+        response, reason = self.fetch(url, retries=retries, backoff=backoff)
+        if response is None:
+            logger.debug(f"fetch_page failed for {url}: {reason}")
+            return None
+        return response.text
 
     def fetch_response(self, url, retries=1):
         """Like fetch_page but hands back the whole response.
@@ -45,44 +330,111 @@ class ScraperClient:
         Store API sends X-WP-Total), which lets us size a catalogue in one
         request instead of paging through it.
         """
-        for attempt in range(1, retries + 1):
-            try:
-                response = self.session.get(url, timeout=20)
-                return response
-            except Exception as e:
-                if attempt >= retries:
-                    logger.debug(f"fetch_response failed for {url}: {e}")
-                    return None
-                time.sleep(DEFAULT_BACKOFF * attempt)
-        return None
+        response, _ = self.fetch(url, retries=retries, timeout=20)
+        return response
 
     def fetch_soup(self, url):
         html = self.fetch_page(url)
-        if html:
-            return BeautifulSoup(html, 'html.parser')
-        return None
+        return BeautifulSoup(html, 'lxml') if html else None
 
-    async def fetch_page_async(self, async_session, url, retries=DEFAULT_RETRIES, backoff=DEFAULT_BACKOFF):
-        """Fetch a page, retrying transient failures. Returns (html, reason).
+    def probe(self, url):
+        """Reachability report for a host, for the pre-scrape analysis.
+
+        Distinguishes 'we got in' from 'we were challenged', because an
+        interactive Cloudflare challenge is something the user needs told
+        about rather than something to keep retrying.
+        """
+        url = normalize_url(url)
+        host = _host_of(url)
+        blocked_reason = None
+        for profile in PROFILE_MEMO.ladder(host):
+            try:
+                response = self._session(profile).get(url, timeout=20)
+            except Exception as e:
+                # A network-level failure is not a fingerprint problem; trying
+                # the rest of the ladder just triples the wait.
+                return {'ok': False, 'html': None, 'profile': None, 'status': None,
+                        'reason': f'{type(e).__name__}: {e}'}
+            outcome, reason = self._classify(response)
+            if outcome == 'ok':
+                PROFILE_MEMO.set(host, profile)
+                return {'ok': True, 'html': response.text, 'profile': profile,
+                        'status': response.status_code, 'reason': None}
+            blocked_reason = reason
+            if outcome == 'permanent':
+                break
+        return {'ok': False, 'html': None, 'profile': None,
+                'status': None, 'reason': blocked_reason or 'unreachable'}
+
+    # ── async ────────────────────────────────────────────────────────────
+
+    async def fetch_page_async(self, async_session, url, retries=DEFAULT_RETRIES,
+                               backoff=DEFAULT_BACKOFF):
+        """Fetch a page, escalating fingerprints then retrying. Returns (html, reason).
 
         html is None when every attempt failed; reason then explains why, so the
         caller can record which URLs were missed instead of silently skipping them.
         """
+        response, reason = await self._fetch_async(async_session, url, retries, backoff)
+        return (response.text if response is not None else None), reason
+
+    async def fetch_bytes_async(self, async_session, url, retries=2,
+                                backoff=DEFAULT_BACKOFF, timeout=DEFAULT_TIMEOUT):
+        """Fetch binary content (images) through the same escalation ladder.
+
+        Images live on the same host as the pages, so a host that rejects our
+        fingerprint rejects them too. Downloading them over a separate,
+        hardcoded-profile session meant a store we had successfully scraped
+        still came back with none of its pictures.
+        """
+        response, reason = await self._fetch_async(async_session, url, retries, backoff,
+                                                   timeout=timeout, binary=True)
+        return (response.content if response is not None else None), reason
+
+    async def _fetch_async(self, async_session, url, retries=DEFAULT_RETRIES,
+                           backoff=DEFAULT_BACKOFF, timeout=DEFAULT_TIMEOUT,
+                           binary=False):
+        """Shared async fetch loop. Returns (response, reason)."""
+        url = normalize_url(url)
+        host = _host_of(url)
         last_reason = 'unknown error'
-        for attempt in range(1, retries + 1):
-            try:
-                response = await async_session.get(url, timeout=30)
-                if response.status_code == 200:
-                    return response.text, None
-                last_reason = f"HTTP {response.status_code}"
-                if response.status_code in PERMANENT_STATUSES:
-                    logger.error(f"Failed to fetch {url}: {last_reason} (not retrying)")
-                    return None, last_reason
-            except Exception as e:
-                last_reason = str(e)
-            if attempt < retries:
-                delay = backoff * attempt
-                logger.warning(f"Attempt {attempt}/{retries} failed for {url} ({last_reason}) — retrying in {delay:.0f}s")
-                await asyncio.sleep(delay)
-        logger.error(f"Giving up on {url} after {retries} attempts: {last_reason}")
+        blocked = False
+
+        for profile in PROFILE_MEMO.ladder(host):
+            session = self._async_session(profile, preferred=async_session)
+            rejected_fingerprint = False
+            for attempt in range(1, retries + 1):
+                try:
+                    response = await session.get(url, timeout=timeout)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    last_reason = f'{type(e).__name__}: {e}'
+                    outcome = 'transient'
+                else:
+                    outcome, reason = self._classify(response, binary=binary)
+                    if outcome == 'ok':
+                        PROFILE_MEMO.set(host, profile)
+                        return response, None
+                    last_reason = reason or last_reason
+                    if outcome == 'permanent':
+                        logger.error(f"Failed to fetch {url}: {last_reason} (not retrying)")
+                        return None, last_reason
+                    if outcome == 'fingerprint':
+                        rejected_fingerprint = blocked = True
+                        break
+
+                if attempt < retries:
+                    delay = backoff * attempt
+                    logger.warning(f"Attempt {attempt}/{retries} failed for {url} "
+                                   f"({last_reason}) — retrying in {delay:.0f}s")
+                    await asyncio.sleep(delay)
+
+            if not rejected_fingerprint:
+                # See fetch(): a network-level failure is not a fingerprint
+                # problem, so the rest of the ladder cannot help.
+                break
+
+        PROFILE_MEMO.record_failure(host, blocked=blocked)
+        logger.error(f"Giving up on {url}: {last_reason}")
         return None, last_reason
