@@ -9,6 +9,8 @@ import logging
 from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
 
+from scraper.client import logger
+
 app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
 CORS(app)
 
