@@ -126,6 +126,31 @@ Once the server is running (using either option), open your web browser and navi
 
 ---
 
+## 🧪 Tests
+
+The suite is offline — no requests leave the machine and nothing is written to `data/`
+(both `app.py` and `main.py` have their storage paths redirected at a `tmp_path`).
+
+```bash
+source venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
+
+| File | Covers |
+| :--- | :--- |
+| `tests/test_parser.py` | JSON-LD extraction, image-variant deduplication, breadcrumb/brand heuristics |
+| `tests/test_client_retry.py` | Retry policy — transient statuses retried, `404` not; `Retry-After` handling |
+| `tests/test_downloader.py` | Skip-if-present, `.part` atomic rename, concurrency limit |
+| `tests/test_main_storage.py` | HTML cache, JSONL dedupe + torn-line recovery, resume, progress reporting |
+| `tests/test_api.py` | Incremental products cache, pagination/search, every export format, path-traversal guard |
+
+> **Note:** the root-level `test_brand.py`, `test_client.py` and `test_product.py` are
+> hand-run diagnostic probes that hit the live site on import — `pytest.ini` pins
+> `testpaths = tests` so a plain `pytest` never collects them.
+
+---
+
 ## 📖 How to Use
 
 1. **Configure Scraping**: On the dashboard, enter a specific product URL to scrape, or leave it blank to scrape the entire sitemap.
