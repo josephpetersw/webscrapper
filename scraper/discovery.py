@@ -76,6 +76,10 @@ PRODUCT_URL_HINTS = ('/product/', '/produkt/', '/products/', '/item/', '/p/',
                      '/dp/', '/buy/')
 ARCHIVE_ROOT_PATHS = ('/shop/', '/store/', '/products/', '/shop', '/store', '/products',
                       '/catalogue/', '/catalogue', '/catalog/', '/catalog')
+# The same names, as bare segments, so the check survives a front controller.
+_ARCHIVE_ROOT_NAMES = {p.strip('/').lower() for p in ARCHIVE_ROOT_PATHS if p.strip('/')}
+
+_FRONT_CONTROLLERS = ('index.php', 'index.html', 'index.htm', 'index.asp', 'index.aspx')
 SITEMAP_FALLBACK_PATHS = ('/sitemap_index.xml', '/sitemap.xml', '/wp-sitemap.xml',
                           '/product-sitemap.xml', '/sitemap.xml.gz',
                           '/sitemap_products_1.xml', '/pub/sitemap.xml',
@@ -97,9 +101,19 @@ def base_url(url):
     return f"{parsed.scheme or 'https'}://{parsed.netloc or parsed.path.split('/')[0]}"
 
 
+def _page_segments(path):
+    """Path segments that carry meaning, with any front controller dropped."""
+    segments = [s for s in (path or '').split('/') if s]
+    while segments and segments[0].lower() in _FRONT_CONTROLLERS:
+        segments.pop(0)
+    return segments
+
+
 def _is_archive_root(url):
-    path = urlparse(url).path.rstrip('/')
-    return (path or '/') in [p.rstrip('/') or '/' for p in ARCHIVE_ROOT_PATHS]
+    """True for the site root or a catalogue index, rather than a product."""
+    segments = _page_segments(urlparse(url).path)
+    return (not segments
+            or (len(segments) == 1 and segments[0].lower() in _ARCHIVE_ROOT_NAMES))
 
 
 def _is_scrapable_page(url, host=None):
@@ -124,7 +138,7 @@ def _is_scrapable_page(url, host=None):
     # sitemaps more often than you would hope. Scraped, they become a record
     # titled after the store itself, which then counts as "already done" on the
     # next run. No product slug is a single segment of three characters or less.
-    segments = [s for s in path.split('/') if s]
+    segments = _page_segments(path)
     if not segments or (len(segments) == 1 and len(segments[0]) <= 3):
         return False
 

@@ -92,7 +92,7 @@ LONG_DESC_SELECTORS = (
 )
 
 BRAND_SELECTORS = (
-    '[itemprop="brand"]', '.product_meta .posted_in a',
+    '[itemprop="brand"]',
     '.woocommerce-product-attributes-item--attribute_pa_brand td',
     '.brand a', '.product-brand', '.product-brand-name',
 )
@@ -175,9 +175,54 @@ def _largest_from_srcset(value):
     return best
 
 
+def brand_from_context(title, categories):
+    """Brand inferred from a product's own category trail and title.
+
+    The last resort, for pages publishing no brand of their own in structured
+    data, meta tags or markup. Split out of the parser so a repair of an
+    already-scraped catalogue cannot drift from what the parser decides today.
+    Returns ``(brand, source)``, or ``('', None)`` when nothing can be trusted.
+    """
+    if categories:
+        category = categories[-1]
+        candidate = _CATEGORY_NOISE.sub('', category).strip(' -–|,')
+        if candidate and _comparison_key(candidate) != _comparison_key(category):
+            return candidate, 'category-heuristic'
+
+    words = (title or '').split()
+    if words and words[0][:1].isalpha():
+        return words[0], 'title-first-word'
+    return '', None
+
+
 def _is_junk_image(url):
     low = (url or '').lower()
     return (not low) or any(token in low for token in _JUNK_IMAGE_TOKENS)
+
+
+_SIZE_SUFFIX = re.compile(r'-(\d+)x(\d+)(?=\.[a-z0-9]{2,5}$)', re.IGNORECASE)
+
+
+def dedupe_image_variants(urls):
+    """Collapse resizes of one picture onto a single URL, preserving order.
+    """
+    best, order = {}, []
+    for url in urls or []:
+        if not url:
+            continue
+        match = _SIZE_SUFFIX.search(url)
+        if match:
+            base = _SIZE_SUFFIX.sub('', url)
+            # An original outranks every resize; among resizes, biggest wins.
+            score = (0, int(match.group(1)) * int(match.group(2)))
+        else:
+            base, score = url, (1, 0)
+        if base not in best:
+            order.append(base)
+            best[base] = (score, url)
+        elif score > best[base][0]:
+            best[base] = (score, url)
+    return [best[base][1] for base in order]
 
 
 def _image_from_tag(tag, base_url):
@@ -245,13 +290,13 @@ class Parser:
         data = {'url': url}
 
         # ── title ────────────────────────────────────────────────────────
-        title = ex.first_str(product.get('name'))
+        title, selector = _select_one_text(soup, TITLE_SELECTORS)
         if title:
-            sources['title'] = 'jsonld'
+            sources['title'] = f'css:{selector}'
         if not title:
-            title, selector = _select_one_text(soup, TITLE_SELECTORS)
+            title = ex.first_str(product.get('name'))
             if title:
-                sources['title'] = f'css:{selector}'
+                sources['title'] = 'jsonld'
         if not title:
             title = ex.meta_content(soup, 'og:title', 'twitter:title')
             if title:
@@ -320,14 +365,14 @@ class Parser:
                             else None)
 
         # ── categories ───────────────────────────────────────────────────
-        categories = ex.jsonld_breadcrumbs(nodes)
+        categories = Parser._clean_breadcrumbs(ex.jsonld_breadcrumbs(nodes), data['title'])
         if categories:
             sources['categories'] = 'jsonld'
-        if not categories:
-            categories, selector = Parser._breadcrumbs_from_markup(soup)
+        else:
+            markup, selector = Parser._breadcrumbs_from_markup(soup)
+            categories = Parser._clean_breadcrumbs(markup, data['title'])
             if categories:
                 sources['categories'] = f'css:{selector}'
-        categories = Parser._clean_breadcrumbs(categories, data['title'])
         data['categories'] = categories
 
         # ── brand ────────────────────────────────────────────────────────
@@ -349,13 +394,10 @@ class Parser:
             text, selector = _select_one_text(soup, BRAND_SELECTORS)
             if text and len(text) < 40:
                 brand, sources['brand'] = text, f'css:{selector}'
-        if not brand and categories:
-            # Stores commonly name a category after the brand: 'Realme Phones'.
-            candidate = _CATEGORY_NOISE.sub('', categories[-1]).strip(' -–|,')
-            if candidate:
-                brand, sources['brand'] = candidate, 'category-heuristic'
-        if not brand and data['title']:
-            brand, sources['brand'] = data['title'].split()[0], 'title-first-word'
+        if not brand:
+            brand, via = brand_from_context(data['title'], categories)
+            if brand:
+                sources['brand'] = via
         data['brand'] = _clean_text(brand) or 'Unknown'
 
         # ── sku ──────────────────────────────────────────────────────────
@@ -498,4 +540,4 @@ class Parser:
             if add([f for f in found if f]):
                 source = 'content-scan'
 
-        return images[:30], source
+        return dedupe_image_variants(images)[:30], source

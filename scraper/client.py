@@ -18,6 +18,7 @@ returns ``(None, reason)`` so callers can record *why* a URL was missed.
 
 import asyncio
 import logging
+import random
 import threading
 import time
 from urllib.parse import quote, urlparse, urlunparse
@@ -41,11 +42,38 @@ DEFAULT_PROFILE = IMPERSONATE_PROFILES[0]
 PERMANENT_STATUSES = (400, 401, 404, 410, 451)
 
 # Statuses that mean "try a different browser fingerprint".
-FINGERPRINT_STATUSES = (403, 406, 429, 503)
+FINGERPRINT_STATUSES = (403, 406, 503)
+
+# Statuses that mean "you are going too fast" — wait, then retry as we were.
+THROTTLE_STATUSES = (429,)
 
 DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF = 2.0
 DEFAULT_TIMEOUT = 30
+
+
+BACKOFF_CAP = 30.0
+RETRY_AFTER_CAP = 60.0
+
+
+def retry_delay(attempt, retry_after=None):
+    """Seconds to wait before retry number ``attempt`` (0-based).
+
+    A server that sends ``Retry-After`` has told us exactly how long to wait, so
+    that wins over any schedule of ours. Otherwise the delay doubles per attempt
+    with a random fraction added: without that jitter, eight workers that hit
+    the same failing host all back off in lockstep and retry in one burst,
+    which looks far more like an attack than the traffic it replaces.
+    """
+    if retry_after:
+        try:
+            return min(float(retry_after), RETRY_AFTER_CAP)
+        except (TypeError, ValueError):
+            # The HTTP-date form of Retry-After. Rare, and not worth parsing —
+            # fall through to our own backoff rather than guessing.
+            pass
+    delay = 2.0 ** min(attempt, 10)
+    return BACKOFF_CAP if delay >= BACKOFF_CAP else delay + random.random()
 
 # After this many URLs on a host have failed the whole ladder, stop walking it.
 # Escalation is worth paying for once per host; paying for it on every URL of a
@@ -239,7 +267,7 @@ class ScraperClient:
     def _classify(response, binary=False):
         """(outcome, reason) for a response.
 
-        outcome is 'ok' | 'permanent' | 'fingerprint' | 'transient'.
+        outcome is 'ok' | 'permanent' | 'fingerprint' | 'throttled' | 'transient'.
         ``binary`` skips the text-body checks — decoding an image as text to
         look for a challenge marker is both wasteful and meaningless.
         """
@@ -262,6 +290,8 @@ class ScraperClient:
         reason = f'HTTP {status}'
         if status in PERMANENT_STATUSES:
             return 'permanent', reason
+        if status in THROTTLE_STATUSES:
+            return 'throttled', reason
         if status in FINGERPRINT_STATUSES:
             return 'fingerprint', reason
         return 'transient', reason
@@ -279,6 +309,7 @@ class ScraperClient:
         for profile in PROFILE_MEMO.ladder(host):
             rejected_fingerprint = False
             for attempt in range(1, retries + 1):
+                retry_after = None
                 try:
                     response = self._session(profile).get(url, timeout=timeout)
                 except Exception as e:
@@ -296,11 +327,13 @@ class ScraperClient:
                     if outcome == 'fingerprint':
                         rejected_fingerprint = blocked = True
                         break  # a different browser profile is the only thing that helps
+                    if outcome == 'throttled':
+                        retry_after = response.headers.get('Retry-After')
 
                 if attempt < retries:
-                    delay = backoff * attempt
+                    delay = retry_delay(attempt - 1, retry_after)
                     logger.debug(f"Attempt {attempt}/{retries} failed for {url} "
-                                 f"({last_reason}) — retrying in {delay:.0f}s")
+                                 f"({last_reason}) — retrying in {delay:.1f}s")
                     time.sleep(delay)
 
             if not rejected_fingerprint:
@@ -403,6 +436,7 @@ class ScraperClient:
             session = self._async_session(profile, preferred=async_session)
             rejected_fingerprint = False
             for attempt in range(1, retries + 1):
+                retry_after = None
                 try:
                     response = await session.get(url, timeout=timeout)
                 except asyncio.CancelledError:
@@ -422,11 +456,13 @@ class ScraperClient:
                     if outcome == 'fingerprint':
                         rejected_fingerprint = blocked = True
                         break
+                    if outcome == 'throttled':
+                        retry_after = response.headers.get('Retry-After')
 
                 if attempt < retries:
-                    delay = backoff * attempt
+                    delay = retry_delay(attempt - 1, retry_after)
                     logger.warning(f"Attempt {attempt}/{retries} failed for {url} "
-                                   f"({last_reason}) — retrying in {delay:.0f}s")
+                                   f"({last_reason}) — retrying in {delay:.1f}s")
                     await asyncio.sleep(delay)
 
             if not rejected_fingerprint:
