@@ -27,4 +27,5 @@ rich==15.0.0
 six==1.17.0
 soupsieve==2.9.1
 typing_extensions==4.16.0
+uvloop==0.22.1
 Werkzeug==3.1.8
