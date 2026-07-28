@@ -376,6 +376,39 @@ Icon-per-service and color-per-status are static lookup tables
 (`STATUS_ICONS`, `SERVICE_STATUS_META`) in `App.jsx` — extend those, not a
 computed class name, when adding a new service or status.
 
+## The browser fallback (`scraper/browser_client.py`)
+
+The last rung of `IMPERSONATE_PROFILES` is a real Chrome, driven by
+`undetected-chromedriver`, for hosts behind an interactive JavaScript
+challenge that no TLS fingerprint can satisfy. It is reached only after every
+curl_cffi profile has been refused.
+
+**The dependency is optional and not in requirements.txt.** Without it,
+`HAS_BROWSER` is False and the rung is absent from the ladder — everything else
+is unaffected. Install it only when you actually need it.
+
+Points that are easy to get wrong, all of which were:
+
+- **`probe()` must never start a browser.** It backs the dashboard's
+  pre-scrape analysis and runs inside a Flask request handler, so launching
+  Chrome there hangs the single-threaded dev server for the length of a
+  challenge. The rung is skipped there; the scrape itself still uses it.
+- **One driver for the process, not one per thread.** A thread-local driver
+  meant eight workers spawned eight Chromes, several GB of memory and eight
+  challenge solves for the same host.
+- **`close_driver()` is called from `ScraperClient.close()`/`aclose()`.**
+  A browser started for the fallback outlives the HTTP sessions otherwise.
+- **No `version_main` pin.** undetected-chromedriver matches the installed
+  Chrome by itself; a hardcoded major version breaks on every other machine.
+- The challenge wait is `CHALLENGE_TIMEOUT` (15s), not the 60s it was: that
+  figure was written for a human solving a CAPTCHA by hand, and on an
+  unattended run it stalled a worker for a minute per URL on a host that was
+  never going to let us in.
+
+The module was previously called `playwright_client` with a `HAS_PLAYWRIGHT`
+flag; it has never used Playwright. The old names are re-exported so nothing
+that imported them breaks.
+
 ## Product storage
 
 Each store folder holds both:

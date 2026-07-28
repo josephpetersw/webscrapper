@@ -925,6 +925,32 @@ def export_json():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def _xml_escape(value):
+    """Escape a value for XML text content.
+
+    Defined once: the two XML exporters each carried their own copy of this
+    lambda, so a fix to one silently left the other wrong.
+    """
+    return (str(value).replace('&', '&amp;')
+                      .replace('<', '&lt;')
+                      .replace('>', '&gt;'))
+
+
+# Formats that are already compressed. Deflating a JPEG costs real CPU and
+# saves essentially nothing, and an image archive here is thousands of files
+# and hundreds of megabytes — so they are stored, not deflated.
+_PRECOMPRESSED_SUFFIXES = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif',
+                           '.mp4', '.webm', '.mp3', '.zip', '.gz', '.woff',
+                           '.woff2', '.ico')
+
+
+def _zip_compression_for(filename):
+    """ZIP_STORED for already-compressed media, ZIP_DEFLATED for the rest."""
+    if (filename or '').lower().endswith(_PRECOMPRESSED_SUFFIXES):
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
+
+
 def clean_html(raw_html):
     if not raw_html: return ""
     text = re.sub(r'<(br|/p|/li|div[^>]*)>', '\n', raw_html, flags=re.IGNORECASE)
@@ -1030,8 +1056,7 @@ def export_xml():
                 short, long_ = _descriptions(item, is_clean)
                 row = product_schema.export_row(item, short, long_)
                 for k in PRODUCT_FIELDS:
-                    v = str(row.get(k, '')).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    f.write(f'    <{k}>{v}</{k}>\n')
+                    f.write(f'    <{k}>{_xml_escape(row.get(k, ""))}</{k}>\n')
                 f.write('  </product>\n')
             f.write('</products>')
         return send_from_directory(export_workspace(), 'products.xml', as_attachment=True, download_name=f'{export_prefix()}_products.xml')
@@ -1074,7 +1099,7 @@ def export_structured_data():
                 for file in files:
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, structured_dir)
-                    zipf.write(file_path, arcname)
+                    zipf.write(file_path, arcname, compress_type=_zip_compression_for(file))
         return send_from_directory(export_workspace(), 'structured_data.zip', as_attachment=True, download_name=f'{export_prefix()}_data_only.zip')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1094,7 +1119,7 @@ def export_structured_images():
                         file_path = os.path.join(root, file)
                         # Keep the product folder name before /images
                         arcname = os.path.join(os.path.basename(os.path.dirname(root)), file)
-                        zipf.write(file_path, arcname)
+                        zipf.write(file_path, arcname, compress_type=_zip_compression_for(file))
         return send_from_directory(export_workspace(), 'structured_images.zip', as_attachment=True, download_name=f'{export_prefix()}_images_only.zip')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1151,12 +1176,11 @@ def build_xml(products, clean):
     # Serialises the declared export fields only. Iterating whatever keys the
     # record happened to carry meant a new parser field landed in the feed
     # unannounced — a dict-valued one as a Python repr inside a tag.
-    esc = lambda v: str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     parts = ['<?xml version="1.0" encoding="UTF-8"?>\n<products>\n']
     for row in _rows(products, clean):
         parts.append('  <product>\n')
         for key in PRODUCT_FIELDS:
-            parts.append(f'    <{key}>{esc(row.get(key, ""))}</{key}>\n')
+            parts.append(f'    <{key}>{_xml_escape(row.get(key, ""))}</{key}>\n')
         parts.append('  </product>\n')
     parts.append('</products>')
     return ''.join(parts).encode('utf-8')
@@ -1211,7 +1235,7 @@ def add_structured_to_zip(zipf, site, fmt, prefix, on_progress=None, should_canc
             full = os.path.join(root, filename)
             arc = os.path.join(prefix, os.path.relpath(full, structured))
             try:
-                zipf.write(full, arc)
+                zipf.write(full, arc, compress_type=_zip_compression_for(full))
                 written += 1
                 # Archives can run to thousands of files; report progress and
                 # check for cancellation periodically so the UI keeps moving

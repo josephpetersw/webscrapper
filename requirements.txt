@@ -34,3 +34,15 @@ typing_extensions==4.16.0
 # Windows and fails, which took the whole install down with it.
 uvloop==0.22.1; sys_platform != "win32"
 Werkzeug==3.1.8
+
+# ── Optional ─────────────────────────────────────────────────────────────
+# undetected-chromedriver adds a real-browser rung to the fetch ladder, tried
+# only after every curl_cffi fingerprint has been refused (see
+# scraper/browser_client.py). Deliberately NOT installed by default: it pulls
+# in Selenium and a full Chrome, and the overwhelming majority of stores never
+# need it. Install it only if you are scraping a site behind an interactive
+# JavaScript challenge:
+#
+#     pip install undetected-chromedriver
+#
+# Without it, HAS_BROWSER is False and the rung is simply absent.

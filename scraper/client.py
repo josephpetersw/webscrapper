@@ -26,7 +26,8 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
-from .playwright_client import fetch_playwright_async, fetch_playwright_sync, HAS_PLAYWRIGHT
+from .browser_client import (HAS_BROWSER, close_driver, fetch_browser_async,
+                             fetch_browser_sync)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -35,10 +36,13 @@ logger = logging.getLogger(__name__)
 # majority of stores; Safari rescues the hosts that specifically block Chrome's
 # JA3. Keep this list short — every entry is a potential extra round trip on a
 # genuinely dead URL.
-if HAS_PLAYWRIGHT:
-    IMPERSONATE_PROFILES = ('chrome', 'safari', 'firefox', 'playwright')
-else:
-    IMPERSONATE_PROFILES = ('chrome', 'safari', 'firefox')
+# The browser rung is last and optional: it only exists when
+# undetected-chromedriver is installed, and it is orders of magnitude slower
+# than a curl_cffi profile, so nothing reaches it until every one of those has
+# been refused.
+BROWSER_PROFILE = 'browser'
+IMPERSONATE_PROFILES = (('chrome', 'safari', 'firefox', BROWSER_PROFILE)
+                        if HAS_BROWSER else ('chrome', 'safari', 'firefox'))
 DEFAULT_PROFILE = IMPERSONATE_PROFILES[0]
 
 # Statuses where retrying — with any fingerprint — cannot help.
@@ -367,6 +371,9 @@ class ScraperClient:
             except Exception:
                 pass
         self._async_sessions.clear()
+        # A browser started for the fallback rung outlives the sessions and
+        # keeps a Chrome process alive until someone kills it.
+        close_driver()
 
     def close(self):
         for session in list(self._sessions.values()):
@@ -375,6 +382,7 @@ class ScraperClient:
             except Exception:
                 pass
         self._sessions.clear()
+        close_driver()
 
     # ── response classification ──────────────────────────────────────────
 
@@ -426,8 +434,8 @@ class ScraperClient:
             for attempt in range(1, retries + 1):
                 retry_after = None
                 try:
-                    if profile == 'playwright':
-                        response = fetch_playwright_sync(url, timeout=timeout)
+                    if profile == BROWSER_PROFILE:
+                        response = fetch_browser_sync(url, timeout=timeout)
                     else:
                         response = self._session(profile).get(url, timeout=timeout)
                 except Exception as e:
@@ -498,11 +506,15 @@ class ScraperClient:
         host = _host_of(url)
         blocked_reason = None
         for profile in PROFILE_MEMO.ladder(host):
+            # Never start a browser here. probe() backs the dashboard's
+            # pre-scrape analysis and runs inside a request handler, where
+            # launching Chrome would hang the whole single-threaded dev server
+            # for the length of a challenge. A site that only yields to a
+            # browser is reported as blocked; the scrape itself still tries it.
+            if profile == BROWSER_PROFILE:
+                continue
             try:
-                if profile == 'playwright':
-                    response = fetch_playwright_sync(url, timeout=20)
-                else:
-                    response = self._session(profile).get(url, timeout=20)
+                response = self._session(profile).get(url, timeout=20)
             except Exception as e:
                 # A network-level failure is not a fingerprint problem; trying
                 # the rest of the ladder just triples the wait.
@@ -559,8 +571,8 @@ class ScraperClient:
             for attempt in range(1, retries + 1):
                 retry_after = None
                 try:
-                    if profile == 'playwright':
-                        response = await fetch_playwright_async(url, timeout=timeout)
+                    if profile == BROWSER_PROFILE:
+                        response = await fetch_browser_async(url, timeout=timeout)
                     else:
                         response = await session.get(url, timeout=timeout)
                 except asyncio.CancelledError:
