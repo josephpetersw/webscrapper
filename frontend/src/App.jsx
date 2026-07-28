@@ -13,6 +13,8 @@ export default function App() {
   const [progress, setProgress] = useState({ current: 0, total: 0, eta: 0 });
   const [products, setProducts] = useState([]);
   const [selectedProduct, setSelectedProduct] = useState(null);
+  const [detailsProduct, setDetailsProduct] = useState(null);
+  const [activeImage, setActiveImage] = useState(0);
   const [previewFile, setPreviewFile] = useState(null);
   const [previewContent, setPreviewContent] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -773,11 +775,11 @@ export default function App() {
                     </div>
                   ) : (
                     products.map((p, i) => (
-                      <div key={i} className={`panel p-0 group cursor-pointer hover:-translate-y-1 transition-transform flex ${listMode ? 'flex-row items-center pr-4' : 'flex-col'}`} onClick={() => setSelectedProduct(p)}>
+                      <div key={i} className={`panel p-0 group cursor-pointer hover:-translate-y-1 transition-transform flex ${listMode ? 'flex-row items-center pr-4' : 'flex-col'}`} onClick={() => { setActiveImage(0); setSelectedProduct(p); }}>
                         <div className={`${listMode ? 'w-32 h-32 flex-none' : 'aspect-square w-full'} bg-[#f4f4f4] dark:bg-[#1b2e4b] overflow-hidden flex items-center justify-center relative`}>
                           {p.images && p.images[0] ? (
-                            <img 
-                              src={`${API}/api/image?title=${encodeURIComponent(p.title)}&filename=${encodeURIComponent(p.images[0].split('/').pop())}`} 
+                            <img
+                              src={productImageUrl(p, p.images[0])}
                               className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
                               alt={p.title}
                               onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'block'; }}
@@ -1082,23 +1084,39 @@ export default function App() {
             <div className="overflow-y-auto p-6 flex flex-col md:flex-row gap-8">
               <div className="w-full md:w-[40%] space-y-4 shrink-0">
                 <div className="aspect-square rounded-md overflow-hidden bg-[#f4f4f4] dark:bg-[#1b2e4b] border border-white-light dark:border-[#1b2e4b]">
-                  {selectedProduct.images?.[0] ? (
-                    <img src={`${API}/data/images/${sanitizeName(selectedProduct.title)}/${selectedProduct.images[0].split('/').pop()}`} className="w-full h-full object-cover" alt="" />
+                  {selectedProduct.images?.[activeImage] || selectedProduct.images?.[0] ? (
+                    <img
+                      src={productImageUrl(selectedProduct, selectedProduct.images[activeImage] || selectedProduct.images[0])}
+                      className="w-full h-full object-contain"
+                      alt={selectedProduct.title}
+                      onError={(e) => { e.currentTarget.style.visibility = 'hidden'; }}
+                    />
                   ) : <div className="w-full h-full flex items-center justify-center"><ImageIcon className="w-12 h-12 opacity-20" /></div>}
                 </div>
-                <div className="flex gap-2 overflow-x-auto pb-2 snap-x">
-                  {selectedProduct.images?.slice(1).map((img, i) => (
-                    <img key={i} src={`${API}/data/images/${sanitizeName(selectedProduct.title)}/${img.split('/').pop()}`} className="w-16 h-16 rounded object-cover cursor-pointer hover:opacity-80 snap-start shrink-0 border border-white-light dark:border-[#1b2e4b]" alt="" />
-                  ))}
-                </div>
+                {selectedProduct.images?.length > 1 && (
+                  <div className="flex gap-2 overflow-x-auto pb-2 snap-x">
+                    {selectedProduct.images.map((img, i) => (
+                      <img
+                        key={i}
+                        src={productImageUrl(selectedProduct, img)}
+                        onClick={() => setActiveImage(i)}
+                        className={`w-16 h-16 rounded object-cover cursor-pointer hover:opacity-80 snap-start shrink-0 border-2 ${i === activeImage ? 'border-primary' : 'border-white-light dark:border-[#1b2e4b]'}`}
+                        alt=""
+                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
-              
+
               <div className="flex-1 space-y-6">
                 <div>
-                  <h4 className="text-3xl font-bold text-secondary mb-2">{selectedProduct.price}</h4>
+                  {selectedProduct.price
+                    ? <h4 className="text-3xl font-bold text-secondary mb-2">{selectedProduct.price}</h4>
+                    : <h4 className="text-lg font-semibold text-[#888ea8] mb-2">No price listed</h4>}
                   <a href={selectedProduct.url} target="_blank" rel="noreferrer" className="text-primary hover:underline font-semibold text-[15px]">View on store ↗</a>
                 </div>
-                
+
                 <div>
                   <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">Brand & Categories</h5>
                   <div className="flex flex-wrap gap-2">
@@ -1106,16 +1124,130 @@ export default function App() {
                        <span className="badge badge-outline-primary">{selectedProduct.brand}</span>
                     )}
                     {selectedProduct.categories?.map((c, i) => <span key={i} className="badge">{c}</span>)}
+                    {!selectedProduct.categories?.length && <span className="text-[13px] text-[#888ea8]">Uncategorised</span>}
                   </div>
                 </div>
 
-                {selectedProduct.short_description && (
-                  <div>
-                    <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">Description</h5>
-                    <div className="text-[15px] leading-relaxed text-black dark:text-[#888ea8] space-y-2" dangerouslySetInnerHTML={{ __html: selectedProduct.short_description }} />
-                  </div>
-                )}
+                <div>
+                  <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">Short description</h5>
+                  {hasContent(selectedProduct.short_description) ? (
+                    <div className="text-[15px] leading-relaxed text-black dark:text-[#888ea8] space-y-2 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5"
+                         dangerouslySetInnerHTML={{ __html: selectedProduct.short_description }} />
+                  ) : (
+                    <p className="text-[15px] text-[#888ea8] italic">No short description found.</p>
+                  )}
+                  <button onClick={() => setDetailsProduct(selectedProduct)} className="btn btn-outline-primary mt-4 gap-2">
+                    <FileText className="w-4 h-4" /> View full details
+                  </button>
+                </div>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Full details — everything held for one product */}
+      {detailsProduct && (
+        <div className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6">
+          <div className="bg-white dark:bg-[#0e1726] rounded-lg shadow-xl w-full max-w-5xl max-h-full flex flex-col overflow-hidden animate-[scaleIn_0.2s_ease-out]">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-white-light dark:border-[#1b2e4b] shrink-0">
+              <div className="pr-8 min-w-0">
+                <h3 className="text-xl font-bold text-black dark:text-white line-clamp-1">{detailsProduct.title}</h3>
+                <p className="text-xs text-[#888ea8] mt-0.5">Full product record</p>
+              </div>
+              <button onClick={() => setDetailsProduct(null)} className="p-1.5 rounded-md hover:bg-[#f4f4f4] dark:hover:bg-[#1b2e4b] text-[#888ea8] shrink-0">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="overflow-y-auto p-6 space-y-8">
+              <section>
+                <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">Details</h5>
+                <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-0">
+                  {PRODUCT_DETAIL_ROWS.map(({ key, label, format }) => {
+                    const value = format ? format(detailsProduct) : detailsProduct[key];
+                    if (value === null || value === undefined || value === '') return null;
+                    return (
+                      <div key={key} className="flex justify-between gap-4 py-2 border-b border-white-light dark:border-[#1b2e4b]">
+                        <dt className="text-[13px] text-[#888ea8] shrink-0">{label}</dt>
+                        <dd className="text-[13px] font-semibold text-black dark:text-white text-right break-words min-w-0">{value}</dd>
+                      </div>
+                    );
+                  })}
+                </dl>
+              </section>
+
+              {detailsProduct.categories?.length > 0 && (
+                <section>
+                  <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">Categories</h5>
+                  <div className="flex flex-wrap gap-2">
+                    {detailsProduct.categories.map((c, i) => <span key={i} className="badge">{c}</span>)}
+                  </div>
+                </section>
+              )}
+
+              <section>
+                <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">Short description</h5>
+                {hasContent(detailsProduct.short_description) ? (
+                  <div className="text-[15px] leading-relaxed text-black dark:text-[#888ea8] space-y-2 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5"
+                       dangerouslySetInnerHTML={{ __html: detailsProduct.short_description }} />
+                ) : (
+                  <p className="text-[15px] text-[#888ea8] italic">No short description found.</p>
+                )}
+              </section>
+
+              <section>
+                <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">Full description</h5>
+                {hasContent(detailsProduct.long_description) ? (
+                  <div className="text-[15px] leading-relaxed text-black dark:text-[#888ea8] space-y-3 max-w-none
+                                  [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-1
+                                  [&_h1]:text-lg [&_h2]:text-base [&_h3]:text-[15px]
+                                  [&_h1]:font-bold [&_h2]:font-bold [&_h3]:font-bold
+                                  [&_h1]:text-black [&_h2]:text-black [&_h3]:text-black
+                                  dark:[&_h1]:text-white dark:[&_h2]:text-white dark:[&_h3]:text-white
+                                  [&_h1]:mt-4 [&_h2]:mt-4 [&_h3]:mt-3
+                                  [&_table]:w-full [&_table]:text-[13px] [&_table]:border-collapse [&_table]:my-3
+                                  [&_td]:border [&_td]:border-white-light dark:[&_td]:border-[#1b2e4b] [&_td]:px-2 [&_td]:py-1
+                                  [&_th]:border [&_th]:border-white-light dark:[&_th]:border-[#1b2e4b] [&_th]:px-2 [&_th]:py-1 [&_th]:text-left
+                                  [&_img]:max-w-full [&_img]:h-auto [&_img]:rounded [&_a]:text-primary [&_a]:underline"
+                       dangerouslySetInnerHTML={{ __html: detailsProduct.long_description }} />
+                ) : (
+                  <p className="text-[15px] text-[#888ea8] italic">No full description found.</p>
+                )}
+              </section>
+
+              {detailsProduct.images?.length > 0 && (
+                <section>
+                  <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">
+                    Images ({detailsProduct.images.length})
+                  </h5>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-3">
+                    {detailsProduct.images.map((img, i) => (
+                      <a key={i} href={productImageUrl(detailsProduct, img)} target="_blank" rel="noreferrer"
+                         className="aspect-square rounded-md overflow-hidden bg-[#f4f4f4] dark:bg-[#1b2e4b] border border-white-light dark:border-[#1b2e4b] flex items-center justify-center">
+                        <img src={productImageUrl(detailsProduct, img)} className="w-full h-full object-cover" alt=""
+                             onError={(e) => { e.currentTarget.replaceWith(Object.assign(document.createElement('span'), { className: 'text-[10px] text-[#888ea8] p-2 text-center', textContent: 'not downloaded' })); }} />
+                      </a>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {detailsProduct.extracted_by && Object.keys(detailsProduct.extracted_by).length > 0 && (
+                <section>
+                  <h5 className="font-bold text-black dark:text-white uppercase tracking-wider text-xs mb-3">How this was extracted</h5>
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(detailsProduct.extracted_by).map(([field, source]) => (
+                      <span key={field} className="badge badge-secondary">{field}: {source}</span>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
+
+            <div className="px-6 py-4 border-t border-white-light dark:border-[#1b2e4b] flex justify-between items-center shrink-0">
+              <a href={detailsProduct.url} target="_blank" rel="noreferrer" className="text-primary hover:underline font-semibold text-[15px]">View on store ↗</a>
+              <button onClick={() => setDetailsProduct(null)} className="btn btn-outline-secondary">Close</button>
             </div>
           </div>
         </div>
@@ -1744,9 +1876,41 @@ export default function App() {
   );
 }
 
-function sanitizeName(name) {
-  return (name || '').replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+// Images are served through the API rather than linked directly: the folder a
+// product was written to is a truncated form of its title, so only the backend
+// (which has the record and the same path helpers the scraper used) can work
+// out where a given image actually landed. Passing the product URL and the
+// original image URL lets it resolve exactly.
+function productImageUrl(product, imageUrl) {
+  if (!product || !imageUrl) return '';
+  const params = new URLSearchParams({
+    url: product.url || '',
+    src: imageUrl,
+    title: product.title || '',
+    filename: imageUrl.split('?')[0].split('/').pop() || '',
+  });
+  return `${API}/api/image?${params.toString()}`;
 }
+
+// Descriptions arrive as HTML and are routinely present but empty ('<p></p>',
+// '&nbsp;'), which would render as a blank section rather than telling the
+// user there is nothing there.
+function hasContent(html) {
+  if (!html) return false;
+  return html.replace(/<[^>]*>/g, '').replace(/&nbsp;/gi, ' ').trim().length > 0;
+}
+
+const PRODUCT_DETAIL_ROWS = [
+  { key: 'brand', label: 'Brand', format: (p) => (p.brand && p.brand !== 'Unknown' ? p.brand : '') },
+  { key: 'price', label: 'Price', format: (p) => p.price || '' },
+  { key: 'price_value', label: 'Price (numeric)', format: (p) => (p.price_value ?? '') === '' ? '' : String(p.price_value) },
+  { key: 'currency', label: 'Currency' },
+  { key: 'sku', label: 'SKU' },
+  { key: 'availability', label: 'Availability' },
+  { key: 'in_stock', label: 'In stock', format: (p) => (p.in_stock === true ? 'Yes' : p.in_stock === false ? 'No' : '') },
+  { key: 'image_count', label: 'Images', format: (p) => String(p.images?.length || 0) },
+  { key: 'category_path', label: 'Category path', format: (p) => (p.categories || []).join(' › ') },
+];
 
 const FILE_KIND_META = {
   image: { Icon: ImageIcon, iconBox: 'bg-warning/10 text-warning' },

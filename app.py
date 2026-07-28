@@ -21,6 +21,9 @@ from flask_cors import CORS
 # The single definition of a product record's fields, shared with the scraper
 # so exports can never drift from what the parser produces.
 from scraper import schema as product_schema
+# Image locations are reproduced with the same helpers the scraper wrote with,
+# so truncated folder and file names still resolve.
+from scraper import paths as product_paths
 
 app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
 CORS(app)
@@ -614,31 +617,159 @@ def list_files():
     return jsonify(get_tree(target_dir))
 
 # ── Dynamic Image Serving ─────────────────────────────────────
+def _find_product(url='', title=''):
+    """Locate a product record by URL (exact) or title, from the cached list."""
+    products = load_products_from_cache()
+    if url:
+        for product in products:
+            if product.get('url') == url:
+                return product
+    if title:
+        for product in products:
+            if product.get('title') == title:
+                return product
+    return None
+
+
+_DIR_INDEX = {}
+
+def _product_dir_index(structured):
+    """{product url: folder} for every product folder on disk.
+
+    Product folder names are *truncated* forms of the title, and the truncation
+    scheme has changed between versions — older data was cut at a fixed length,
+    current data gets a hash appended so similar titles stay distinct.
+    Recomputing today's name cannot find yesterday's folder, and re-scraping a
+    catalogue to fix a display bug is not a reasonable thing to ask.
+
+    So the index keys on the URL inside each folder's own ``data.json``, which
+    is authoritative. Matching folders by name similarity instead looks like it
+    works and quietly serves the wrong product's photos: two configurations of
+    the same laptop share the first sixty characters of their titles, which is
+    precisely the collision the hash suffix exists to prevent.
+
+    Built once per tree and cached; a few hundred small reads on first use.
+    """
+    try:
+        stamp = os.path.getmtime(structured)
+    except OSError:
+        return {}
+    entry = _DIR_INDEX.get(structured)
+    if entry and entry['stamp'] == stamp:
+        return entry['by_url']
+
+    by_url = {}
+    for root, subdirs, files in os.walk(structured):
+        if 'images' not in subdirs or 'data.json' not in files:
+            continue
+        try:
+            with open(os.path.join(root, 'data.json'), 'r', encoding='utf-8') as handle:
+                url = (json.load(handle) or {}).get('url')
+        except Exception:
+            continue
+        if url:
+            by_url.setdefault(url, root)
+
+    _DIR_INDEX[structured] = {'stamp': stamp, 'by_url': by_url}
+    return by_url
+
+
+def _match_file(directory, wanted):
+    """Best match for a filename in a directory, tolerating truncation."""
+    if not wanted:
+        return ''
+    target = os.path.join(directory, wanted)
+    if os.path.exists(target):
+        return target
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return ''
+    stem = os.path.splitext(wanted)[0]
+    for entry in entries:
+        entry_stem = os.path.splitext(entry)[0]
+        if entry_stem == stem or entry_stem.startswith(stem[:40]) or stem.startswith(entry_stem[:40]):
+            return os.path.join(directory, entry)
+    return ''
+
+
+def _resolve_image(product, src='', filename=''):
+    """On-disk path for one of a product's images, or ''.
+
+    Tries the exact location first, computed with the *same* helpers the
+    scraper wrote with (`scraper.paths`) — both the product folder and the
+    image filename may have been shortened to keep the whole path inside the
+    filesystem limit, so re-deriving the untruncated name (as this endpoint
+    used to) simply misses those files. Anything the exact computation cannot
+    place falls back to matching what is on disk, which covers data written by
+    earlier versions.
+    """
+    structured = site_file('structured')
+    if not structured or not product:
+        return ''
+
+    title = product.get('title', '')
+    wanted = os.path.basename((src or filename or '').split('?')[0])
+
+    candidates = [product_paths.build_product_dir(
+        structured, product.get('categories'), title, product.get('url', ''))]
+
+    # Then wherever this exact product actually lives on disk, identified by
+    # its own URL rather than by a name that may have been truncated
+    # differently when it was written.
+    on_disk = _product_dir_index(structured).get(product.get('url'))
+    if on_disk:
+        candidates.append(on_disk)
+
+    for product_dir in candidates:
+        image_dir = os.path.join(product_dir, 'images')
+        if not os.path.isdir(image_dir):
+            continue
+        if src:
+            exact = product_paths.image_path(image_dir, src)
+            if exact and os.path.exists(exact):
+                return exact
+        found = _match_file(image_dir, wanted)
+        if found:
+            return found
+    return ''
+
+
 @app.route('/api/image', methods=['GET'])
 def get_image():
     title = request.args.get('title', '')
     filename = request.args.get('filename', '')
-    if not title or not filename:
-        return jsonify({'error': 'Missing title or filename'}), 400
-        
-    import re
-    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', title)
-    safe_name = re.sub(r'_+', '_', safe_name).strip('_')
-    
-    # 1. Check flat path within the active site
-    old_path = os.path.join(site_file('images'), safe_name, filename) if site_file('images') else ''
-    if old_path and os.path.exists(old_path):
-        return send_from_directory(os.path.dirname(old_path), filename)
+    url = request.args.get('url', '')
+    src = request.args.get('src', '')
+    if not (url or title) or not (src or filename):
+        return jsonify({'error': 'Missing product reference or image reference'}), 400
 
-    # 2. Check structured path by scanning
+    # 1. Exact resolution via the shared path helpers.
+    product = _find_product(url, title)
+    if product:
+        found = _resolve_image(product, src, filename)
+        if found:
+            return send_from_directory(os.path.dirname(found), os.path.basename(found))
+
+    name = filename or os.path.basename((src or '').split('?')[0])
+    safe_name = product_paths.safe_path_segment(title or (product or {}).get('title', ''))
+
+    # 2. Legacy flat layout, kept so previously-scraped sites still display.
+    images_root = site_file('images')
+    old_path = os.path.join(images_root, safe_name, name) if images_root else ''
+    if old_path and os.path.exists(old_path):
+        return send_from_directory(os.path.dirname(old_path), name)
+
+    # 3. Last resort: scan the tree. Only reached for data written by an older
+    #    version, so the cost is acceptable and no longer the common path.
     structured_dir = site_file('structured')
-    if os.path.exists(structured_dir):
-        for root, dirs, files in os.walk(structured_dir):
+    if structured_dir and os.path.exists(structured_dir):
+        for root, _dirs, _files in os.walk(structured_dir):
             if os.path.basename(root) == safe_name:
-                img_path = os.path.join(root, 'images', filename)
+                img_path = os.path.join(root, 'images', name)
                 if os.path.exists(img_path):
-                    return send_from_directory(os.path.dirname(img_path), filename)
-                    
+                    return send_from_directory(os.path.dirname(img_path), name)
+
     return jsonify({'error': 'Image not found'}), 404
 
 # ── Serve Data Files ──────────────────────────────────────────
