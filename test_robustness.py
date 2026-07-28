@@ -208,6 +208,16 @@ check('off-host rejected',
       not disc._is_scrapable_page('https://cdn.other.com/product/x', 'x.com'))
 check('on-host kept', disc._is_scrapable_page('https://x.com/product/x', 'x.com'))
 
+check('shop root behind a front controller rejected',
+      not disc._is_scrapable_page('https://x.com/index.php/shop/'))
+check('homepage behind a front controller rejected',
+      not disc._is_scrapable_page('https://x.com/index.php/'))
+check('site root rejected', not disc._is_scrapable_page('https://x.com/'))
+check('product behind a front controller kept',
+      disc._is_scrapable_page('https://x.com/index.php/product/192-eggs/'))
+check('product whose slug merely starts with shop is kept',
+      disc._is_scrapable_page('https://x.com/shopping-trolley-large/'))
+
 catalogue = [f'https://x.com/catalogue/item-{i}_{i}/' for i in range(40)]
 noise = ['https://x.com/about', 'https://x.com/contact-us']
 check('dominant shape inferred',
