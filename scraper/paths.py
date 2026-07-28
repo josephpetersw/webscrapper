@@ -39,6 +39,12 @@ MAX_SEGMENT_LEN = 60
 MIN_SEGMENT_LEN = 12
 MAX_FILENAME_LEN = 100
 MIN_FILENAME_LEN = 24
+# Room left for the trailing 'images/<filename>' when siting a product folder.
+# Deliberately not MAX_FILENAME_LEN: that is the cap on a name, not the typical
+# length, and reserving all of it flattens the category tree on perfectly
+# ordinary paths. image_path() shortens the filename to whatever is actually
+# left, so this only has to guarantee a usable name still fits.
+IMAGE_NAME_RESERVE = 48
 
 # Characters Windows refuses in a filename, plus control codes.
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -114,7 +120,7 @@ def _full_len(path):
 
 
 def build_product_dir(structured_root, categories, title, url='',
-                      max_path=MAX_PATH, reserve=MAX_FILENAME_LEN):
+                      max_path=MAX_PATH, reserve=IMAGE_NAME_RESERVE):
     """Directory for one product, guaranteed to leave room for its images.
 
     ``reserve`` is the space kept free for the trailing ``images/<filename>``.
@@ -123,7 +129,11 @@ def build_product_dir(structured_root, categories, title, url='',
     product's own identity — and only then is the product folder itself
     squeezed, always with a hash so distinct products stay distinct.
     """
-    segments = [safe_path_segment(c, 40) for c in (categories or []) if c]
+    # A category of punctuation ('---', '&') sanitises to nothing. Keeping it
+    # as the placeholder would put a literal 'unnamed' level in the middle of
+    # every affected tree, so such levels are dropped instead.
+    segments = [s for s in (safe_path_segment(c, 40) for c in (categories or []) if c)
+                if s != 'unnamed']
     name = safe_path_segment(title or url.rstrip('/').split('/')[-1])
     budget = max_path - reserve - len('images') - PATH_SAFETY_MARGIN
 

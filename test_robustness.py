@@ -250,8 +250,39 @@ memo = client_mod._ContextMemo()
 check('a fresh host offers every candidate',
       len(memo.candidates('a.test')) == len(client_mod.PRICE_CONTEXT_PARAMS))
 memo.remember('a.test', {'sid': 'SLOTTED'})
-check('a solved host offers only the known answer',
-      memo.candidates('a.test') == [{'sid': 'SLOTTED'}])
+check('a solved host tries the known answer first',
+      memo.candidates('a.test')[0] == {'sid': 'SLOTTED'})
+# One storefront can stock the same catalogue under several fulfilment modes:
+# a product missing from the remembered one may still be priced under another.
+# Returning only the known set silently loses those.
+check('a solved host still offers the alternates as fallback',
+      len(memo.candidates('a.test')) == len(client_mod.PRICE_CONTEXT_PARAMS))
+check('the known answer is not duplicated among the alternates',
+      memo.candidates('a.test').count({'sid': 'SLOTTED'}) == 1)
+
+# Concurrent workers finish out of order; the recorded answer must not be a
+# matter of timing, and the log must not claim two answers for one host.
+memo_race = client_mod._ContextMemo()
+memo_race.remember('r.test', {'sid': 'SLOTTED'})
+memo_race.remember('r.test', {'sid': 'EXPRESS'})
+check('first writer wins a concurrent discovery',
+      memo_race.candidates('r.test')[0] == {'sid': 'SLOTTED'})
+
+# The alternates cost a request each, so they are retired if they never pay off.
+memo_tired = client_mod._ContextMemo()
+memo_tired.remember('t.test', {'sid': 'SLOTTED'})
+for _ in range(client_mod._CONTEXT_PROBE_LIMIT + 1):
+    memo_tired.candidates('t.test')
+check('unproductive alternates are eventually retired',
+      memo_tired.candidates('t.test') == [{'sid': 'SLOTTED'}])
+
+memo_paid = client_mod._ContextMemo()
+memo_paid.remember('p.test', {'sid': 'SLOTTED'})
+for _ in range(client_mod._CONTEXT_PROBE_LIMIT + 1):
+    memo_paid.candidates('p.test')
+    memo_paid.credit('p.test')   # a fallback earned a price
+check('alternates that keep paying off are kept',
+      len(memo_paid.candidates('p.test')) == len(client_mod.PRICE_CONTEXT_PARAMS))
 
 memo2 = client_mod._ContextMemo()
 memo2.settle('b.test')
@@ -293,8 +324,11 @@ deep = ['Networking Equipment', 'Ubiquiti Networking Equipment', 'Ubiquiti Switc
 title = 'Ubiquiti UniFi Pro Max 24 Port L3 Managed PoE Switch price in Kenya'
 pdir = pu.build_product_dir(os.path.join('data', 'example.co.ke', 'structured'),
                             deep, title, 'https://example.co.ke/product/x')
-check('product dir within budget',
-      len(os.path.abspath(pdir)) <= pu.MAX_PATH - pu.MAX_FILENAME_LEN, len(os.path.abspath(pdir)))
+# The invariant is that a *usable* image name still fits underneath, not that
+# the longest name a site could possibly use does.
+check('product dir leaves room for an image',
+      len(os.path.abspath(pdir)) + len(os.sep + 'images' + os.sep)
+      + pu.MIN_FILENAME_LEN <= pu.MAX_PATH, len(os.path.abspath(pdir)))
 ipath = pu.image_path(os.path.join(pdir, 'images'),
                       'https://example.co.ke/wp-content/uploads/2025/05/'
                       'Ubiquiti-UniFi-Pro-Max-24-Port-L3-Managed-PoE-Switch-USW-Pro-Max-24-PoE.jpg')
@@ -305,7 +339,8 @@ check('image path keeps extension', ipath.endswith('.jpg'), ipath)
 # Absurd input must still yield a usable path rather than blowing the budget.
 absurd = pu.build_product_dir('data/s/structured', ['C' * 90] * 6, 'T' * 300)
 check('absurd input still budgeted',
-      len(os.path.abspath(absurd)) <= pu.MAX_PATH - pu.MAX_FILENAME_LEN,
+      len(os.path.abspath(absurd)) + len(os.sep + 'images' + os.sep)
+      + pu.MIN_FILENAME_LEN <= pu.MAX_PATH,
       len(os.path.abspath(absurd)))
 check('no-category product still gets a dir',
       pu.build_product_dir('data/s/structured', [], 'Thing').endswith('Thing'))

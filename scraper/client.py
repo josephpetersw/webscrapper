@@ -250,6 +250,7 @@ class _ContextMemo:
         self._known = {}      # host -> params that produced a price
         self._probes = {}     # host -> how many products we have probed
         self._settled = set()  # hosts needing nothing, or proven hopeless
+        self._fallback_misses = {}  # host -> products the alternates also failed
 
     def known(self, host):
         with self._lock:
@@ -259,18 +260,35 @@ class _ContextMemo:
         if not host:
             return
         with self._lock:
+            # First writer wins. Workers run concurrently, so several products
+            # can be probing at once and finish out of order; letting the last
+            # one overwrite makes the recorded answer a matter of timing, and
+            # the log claim two different answers for one host.
+            if host in self._known:
+                return
             self._known[host] = params
             self._settled.add(host)
-        logger.info(f"{host} only prices products with {params} — "
-                    f"applying that to the rest of this run")
+        logger.info(f"{host} prices products with {params} — "
+                    f"trying that first for the rest of this run")
 
     def candidates(self, host):
-        """Parameter sets still worth trying for this host, or []."""
+        """Parameter sets still worth trying for this host, most likely first."""
         if not host:
             return []
         with self._lock:
-            if host in self._known:
-                return [self._known[host]]
+            known = self._known.get(host)
+            if known:
+                # The known answer first, but not *only* it. One storefront can
+                # stock the same catalogue under several fulfilment modes, so a
+                # product absent from the remembered one may still be priced
+                # under another; returning just the known set silently loses
+                # those. The alternates are dropped once they have failed to
+                # earn their keep across several products.
+                others = [p for p in PRICE_CONTEXT_PARAMS if p != known]
+                if self._fallback_misses.get(host, 0) >= _CONTEXT_PROBE_LIMIT:
+                    return [known]
+                self._fallback_misses[host] = self._fallback_misses.get(host, 0) + 1
+                return [known] + others
             if host in self._settled:
                 return []
             if self._probes.get(host, 0) >= _CONTEXT_PROBE_LIMIT:
@@ -280,6 +298,12 @@ class _ContextMemo:
                 return []
             self._probes[host] = self._probes.get(host, 0) + 1
         return list(PRICE_CONTEXT_PARAMS)
+
+    def credit(self, host):
+        """A fallback attempt paid off — stop counting against the alternates."""
+        if host:
+            with self._lock:
+                self._fallback_misses.pop(host, None)
 
     def settle(self, host):
         """Record that this host needs nothing — prices arrive unprompted."""

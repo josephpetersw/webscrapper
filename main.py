@@ -1,4 +1,6 @@
 import asyncio
+import gzip
+import hashlib
 import json
 import logging
 import os
@@ -35,14 +37,101 @@ logger.propagate = False
 DATA_DIR = 'data'
 # Live run state, shared by whichever site is being scraped, so the dashboard
 # always has a single place to poll for progress.
-PROGRESS_FILE = os.path.join(DATA_DIR, 'progress.json')
+PROGRESS_JSON = os.path.join(DATA_DIR, 'progress.json')
+PROGRESS_FILE = PROGRESS_JSON  # long-standing name, kept for callers
 ACTIVE_SITE_FILE = os.path.join(DATA_DIR, '.active_site')
+
+# Storage for the run currently in progress. Every store gets its own folder,
+# so these are pointed at that folder by configure_run_paths() before a scrape
+# starts rather than being fixed at import time. They are module-level because
+# the storage helpers below are the API the rest of the file (and the tests)
+# use, and threading a paths dict through all of them buys nothing.
+STRUCTURED_DIR = None
+HTML_CACHE_DIR = None
+PRODUCTS_JSONL = None
+PRODUCTS_JSON = None
+CATEGORIES_JSON = None
+FAILED_JSON = None
+IMAGES_DIR = None
+
+
+def configure_run_paths(site_dir):
+    """Point the storage helpers at one store's folder."""
+    global STRUCTURED_DIR, HTML_CACHE_DIR, PRODUCTS_JSONL, PRODUCTS_JSON
+    global CATEGORIES_JSON, FAILED_JSON, IMAGES_DIR
+    STRUCTURED_DIR = os.path.join(site_dir, 'structured')
+    HTML_CACHE_DIR = os.path.join(site_dir, 'cache', 'html')
+    PRODUCTS_JSONL = os.path.join(site_dir, 'products.jsonl')
+    PRODUCTS_JSON = os.path.join(site_dir, 'products.json')
+    CATEGORIES_JSON = os.path.join(site_dir, 'categories.json')
+    FAILED_JSON = os.path.join(site_dir, 'failed_urls.json')
+    IMAGES_DIR = os.path.join(site_dir, 'images')
+    return site_paths(site_dir)
+
+
+# ── Atomic writes ────────────────────────────────────────────────────────
+
+def _write_json_atomic(path, payload, indent=None):
+    """Write JSON via a temp file + rename.
+
+    These files are rewritten while the dashboard polls them. Writing in place
+    lets a reader observe a half-written file and fail to parse it; renaming
+    swaps the file in as a single step, so a reader always sees either the old
+    copy or the new one.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    tmp = f'{path}.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=indent, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# Kept: the original spelling is used across this file and by callers.
+write_json_atomic = _write_json_atomic
+
+
+# ── Progress ─────────────────────────────────────────────────────────────
+
+class ProgressReporter:
+    """Writes data/progress.json, but not on every single completion.
+
+    The dashboard polls this a couple of times a second; rewriting it once per
+    product on an eight-worker run is a few hundred pointless writes a minute
+    and buys the reader nothing it would ever see. Throttling to an interval
+    keeps the bar smooth and the disk quiet. The final update always passes
+    force so a finished run never appears stuck one short.
+    """
+
+    def __init__(self, total, min_interval=1.0, path=None):
+        self.total = total
+        self.min_interval = min_interval
+        self.path = path
+        self.started = time.time()
+        self._last_write = 0.0
+
+    def update(self, current, force=False):
+        now = time.time()
+        if not force and (now - self._last_write) < self.min_interval:
+            return
+        self._last_write = now
+        elapsed = now - self.started
+        eta = ((self.total - current) * (elapsed / current)) if current > 0 else 0
+        _write_json_atomic(self.path or PROGRESS_JSON,
+                           {'current': current, 'total': self.total,
+                            'eta': round(eta, 2) if eta else 0})
 
 
 def update_progress(current, total, eta=0):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(PROGRESS_FILE, 'w') as f:
-        json.dump({'current': current, 'total': total, 'eta': eta}, f)
+    """One-shot progress write, for the start and end of a run."""
+    _write_json_atomic(PROGRESS_JSON,
+                       {'current': current, 'total': total, 'eta': eta})
 
 
 def site_folder_name(url):
@@ -95,6 +184,160 @@ def set_active_site(folder_name):
         f.write(folder_name)
 
 
+# ── Product records ──────────────────────────────────────────────────────
+# Products are appended to products.jsonl one line at a time as they are
+# scraped, instead of rewriting the whole of products.json every few
+# completions. On a 3,000-product run that rewrite was quadratic — hundreds of
+# rewrites of a file growing towards 50MB, several GB of cumulative writes for
+# data nobody read. Appending is O(1) per product, and a run killed halfway
+# leaves every completed product already on disk.
+
+def _append_product_record(record):
+    """Append one product as a JSON line."""
+    os.makedirs(os.path.dirname(os.path.abspath(PRODUCTS_JSONL)) or '.', exist_ok=True)
+    with open(PRODUCTS_JSONL, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+
+def _read_all_products():
+    """Every product from products.jsonl, latest record per URL winning.
+
+    A re-scrape appends rather than rewriting, so the same URL can appear more
+    than once; the last line for a URL is the current truth. Records with no
+    URL cannot be de-duplicated and are all kept.
+
+    The file is appended to live, so a killed run can leave a half-written
+    final line. That line is skipped rather than treated as corruption of the
+    whole file — losing one product is recoverable, losing the catalogue is not.
+    """
+    if not PRODUCTS_JSONL or not os.path.exists(PRODUCTS_JSONL):
+        return []
+
+    by_url, anonymous, order = {}, [], []
+    try:
+        with open(PRODUCTS_JSONL, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue  # torn final line, or a single bad write
+                if not isinstance(record, dict):
+                    continue
+                url = record.get('url')
+                if not url:
+                    anonymous.append(record)
+                    continue
+                if url not in by_url:
+                    order.append(url)
+                by_url[url] = record
+    except OSError as e:
+        logger.error(f'Could not read {PRODUCTS_JSONL}: {e}')
+        return []
+
+    return [by_url[u] for u in order] + anonymous
+
+
+def _load_scraped_urls():
+    """URLs already scraped, so a re-run does only what is missing.
+
+    Prefers products.jsonl. Falls back to a legacy products.json so a catalogue
+    scraped by an older version still resumes instead of starting over.
+    """
+    if PRODUCTS_JSONL and os.path.exists(PRODUCTS_JSONL):
+        return {p['url'] for p in _read_all_products() if p.get('url')}
+
+    if PRODUCTS_JSON and os.path.exists(PRODUCTS_JSON):
+        try:
+            with open(PRODUCTS_JSON, 'r', encoding='utf-8') as f:
+                legacy = json.load(f)
+        except (ValueError, OSError) as e:
+            logger.warning(f'Could not read {PRODUCTS_JSON} ({e}); starting fresh.')
+            return set()
+        if isinstance(legacy, list):
+            return {p['url'] for p in legacy
+                    if isinstance(p, dict) and p.get('url')}
+    return set()
+
+
+# ── HTML cache ───────────────────────────────────────────────────────────
+
+def _html_cache_path(url):
+    digest = hashlib.sha1((url or '').encode('utf-8', 'replace')).hexdigest()
+    return os.path.join(HTML_CACHE_DIR, f'{digest}.html.gz')
+
+
+def _write_cached_html(url, html):
+    """Store a fetched page, gzipped, keyed by URL.
+
+    Written through a temp file: a run killed mid-write would otherwise leave a
+    truncated archive that every later run would try, and fail, to read.
+    """
+    if not html:
+        return
+    os.makedirs(HTML_CACHE_DIR, exist_ok=True)
+    path = _html_cache_path(url)
+    tmp = path + '.tmp'
+    try:
+        with gzip.open(tmp, 'wt', encoding='utf-8') as f:
+            f.write(html)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.debug(f'Could not cache {url}: {e}')
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _read_cached_html(url):
+    """The cached page, or None. A corrupt entry counts as a miss."""
+    if not HTML_CACHE_DIR:
+        return None
+    path = _html_cache_path(url)
+    if not os.path.exists(path):
+        return None
+    try:
+        with gzip.open(path, 'rt', encoding='utf-8') as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+# ── Per-product output ───────────────────────────────────────────────────
+
+def _structured_dir_for(data, url):
+    """Folder for one product, nested under its category trail."""
+    return paths_util.build_product_dir(
+        STRUCTURED_DIR, data.get('categories'), data.get('title'), url)
+
+
+def write_product_files(data, out_dir):
+    """Write data.json, the descriptions, and the images folder for a product.
+
+    Idempotent: a re-scrape overwrites in place, so re-running never leaves a
+    stale description beside a fresh record.
+    """
+    os.makedirs(os.path.join(out_dir, 'images'), exist_ok=True)
+
+    long_desc = data.get('long_description')
+    if long_desc:
+        import markdownify
+        with open(os.path.join(out_dir, 'description.md'), 'w', encoding='utf-8') as f:
+            f.write(markdownify.markdownify(long_desc, heading_style='ATX'))
+
+    short_desc = data.get('short_description')
+    if short_desc:
+        from bs4 import BeautifulSoup
+        text = BeautifulSoup(short_desc, 'lxml').get_text(strip=True, separator='\n')
+        with open(os.path.join(out_dir, 'short_description.txt'), 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    _write_json_atomic(os.path.join(out_dir, 'data.json'), data, indent=2)
+
+
 def discover_product_urls(client, parser, site_url):
     """Find every product URL on a store (see scraper/discovery.py)."""
     return discovery.discover_products(client, parser, site_url)['urls']
@@ -102,56 +345,55 @@ def discover_product_urls(client, parser, site_url):
 
 def load_existing_products(resume, paths):
     """Return (products, scraped_urls) from a previous run so it can be continued."""
-    if not resume or not os.path.exists(paths['products']):
+    if not resume:
         return [], set()
-    try:
-        with open(paths['products'], 'r', encoding='utf-8') as f:
-            products = json.load(f)
-    except Exception as e:
-        logger.warning(f"Could not read existing {paths['products']} ({e}) - starting fresh.")
+    # products.jsonl is the live record; products.json is the legacy snapshot.
+    products = _read_all_products()
+    if not products and os.path.exists(paths['products']):
+        try:
+            with open(paths['products'], 'r', encoding='utf-8') as f:
+                products = json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not read existing {paths['products']} ({e}) - starting fresh.")
+            return [], set()
+    if not isinstance(products, list):
         return [], set()
     # Only records that actually parsed count as done; empty/junk rows get re-scraped.
-    valid = [p for p in products if p.get('url') and p.get('title')]
+    valid = [p for p in products if isinstance(p, dict) and p.get('url') and p.get('title')]
     return valid, {p['url'] for p in valid}
 
 
-def write_json_atomic(path, payload):
-    """Write JSON via a temp file + rename.
-
-    These files are rewritten every few seconds while the dashboard polls them.
-    Writing in place lets a reader observe a half-written file and fail to
-    parse it; renaming swaps the file in as a single step so a reader always
-    sees either the old copy or the new one.
-    """
-    tmp = f"{path}.tmp"
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
 def save_results(state):
+    """Write the snapshot files the dashboard and exports read.
+
+    The per-product record is already durable — it was appended to
+    products.jsonl the moment it was scraped — so this is a convenience
+    snapshot, not the source of truth. It is therefore safe to write it on a
+    time interval rather than every few products.
+    """
     paths = state['paths']
     try:
         os.makedirs(paths['dir'], exist_ok=True)
-        write_json_atomic(paths['products'], state['products'])
-        write_json_atomic(paths['categories'], sorted(state['categories']))
-        write_json_atomic(paths['failed'], state['failed'])
+        _write_json_atomic(paths['products'], state['products'], indent=2)
+        _write_json_atomic(paths['categories'], sorted(state['categories']), indent=2)
+        _write_json_atomic(paths['failed'], state['failed'], indent=2)
     except Exception as e:
         # Losing one periodic flush must never end the run - the next one retries.
         logger.error(f"Could not save results: {e}")
 
 
+# How often the products.json snapshot is refreshed while a run is in flight.
+SNAPSHOT_INTERVAL = 20.0
+
+
 def mark_completed(state, url, note):
     state['completed'] += 1
-    elapsed = time.time() - state['start_time']
-    if state['completed'] > 0:
-        avg_time = elapsed / state['completed']
-        eta_seconds = (state['total'] - state['completed']) * avg_time
-    else:
-        eta_seconds = 0
-    update_progress(state['completed'], state['total'], eta_seconds)
+    state['progress'].update(state['completed'])
     logger.info(f"{note} {state['completed']}/{state['total']}: {url}")
-    if state['completed'] % 10 == 0:
+
+    now = time.time()
+    if now - state.get('last_snapshot', 0) >= SNAPSHOT_INTERVAL:
+        state['last_snapshot'] = now
         save_results(state)
 
 
@@ -193,6 +435,10 @@ async def recover_missing_price(data, url, async_session, parser, state):
         retried = parser.parse_product(html, url)
         if retried and (retried.get('price') or retried.get('price_value') is not None):
             client.CONTEXT_MEMO.remember(host, params)
+            # This product earned its price from whichever set worked, so the
+            # alternates are still pulling their weight and should not be
+            # retired for being tried.
+            client.CONTEXT_MEMO.credit(host)
             # Keep the original URL: the parameter is how we asked, not where
             # the product lives, and it must not end up in the exported feed.
             retried['url'] = url
@@ -234,35 +480,21 @@ async def _scrape_product_inner(url, async_session, parser, downloader, semaphor
 
         # Category trail + product folder, budgeted so there is still room for
         # the image filenames underneath it.
-        structured_dir = paths_util.build_product_dir(
-            state['paths']['structured'], data.get('categories'), data.get('title'), url)
-        os.makedirs(structured_dir, exist_ok=True)
-
-        # Save descriptions
-        if data.get('long_description'):
-            with open(os.path.join(structured_dir, 'description.md'), 'w', encoding='utf-8') as f:
-                import markdownify
-                md = markdownify.markdownify(data['long_description'], heading_style="ATX")
-                f.write(md)
-        if data.get('short_description'):
-            with open(os.path.join(structured_dir, 'short_description.txt'), 'w', encoding='utf-8') as f:
-                from bs4 import BeautifulSoup
-                txt = BeautifulSoup(data['short_description'], 'lxml').get_text(strip=True, separator='\n')
-                f.write(txt)
-
-        # Save data.json
-        with open(os.path.join(structured_dir, 'data.json'), 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-        image_dir = os.path.join(structured_dir, 'images')
+        structured_dir = _structured_dir_for(data, url)
+        write_product_files(data, structured_dir)
 
         # Download images for this product immediately
+        image_dir = os.path.join(structured_dir, 'images')
         image_tasks = [
             downloader.download_image(async_session, img_url, image_dir)
             for img_url in data.get('images', [])
         ]
         if image_tasks:
             await asyncio.gather(*image_tasks)
+
+        # Durable the moment it is scraped, so a killed run keeps everything
+        # completed so far without waiting for the next snapshot.
+        _append_product_record(data)
 
         state['products'].append(data)
         for cat in data.get('categories') or []:
@@ -293,6 +525,8 @@ async def run_concurrent_scraper(product_urls, workers, paths, existing_products
         'client': client,
         'paths': paths,
         'start_time': time.time(),
+        'progress': ProgressReporter(total=len(product_urls)),
+        'last_snapshot': time.time(),
     }
     for product in existing_products:
         for cat in product.get('categories') or []:
@@ -321,6 +555,9 @@ async def run_concurrent_scraper(product_urls, workers, paths, existing_products
         except Exception:
             pass
 
+    # Always force a final write: a throttled reporter would otherwise leave a
+    # finished run showing one short.
+    state['progress'].update(state['completed'], force=True)
     save_results(state)
 
     scraped_now = len(state['products']) - len(existing_products)
@@ -344,7 +581,8 @@ def run_scraper(limit=None, target_url=None, workers=8, resume=True,
     parser = Parser()
 
     site_dir = resolve_site_dir(target_url, new_version)
-    paths = site_paths(site_dir)
+    # Points the storage helpers at this store's folder for the whole run.
+    paths = configure_run_paths(site_dir)
     os.makedirs(site_dir, exist_ok=True)
     set_active_site(os.path.basename(site_dir))
     logger.info(f"Output directory: {site_dir}")

@@ -376,13 +376,78 @@ Icon-per-service and color-per-status are static lookup tables
 (`STATUS_ICONS`, `SERVICE_STATUS_META`) in `App.jsx` — extend those, not a
 computed class name, when adding a new service or status.
 
+## Product storage
+
+Each store folder holds both:
+
+- **`products.jsonl`** — the source of truth. One JSON object per line,
+  appended the moment a product is scraped, so a run killed at any point keeps
+  everything already completed. A re-scrape appends rather than rewriting, so a
+  URL can appear more than once and **the last line for a URL wins**.
+- **`products.json`** — a snapshot of the same data, refreshed every
+  `SNAPSHOT_INTERVAL` seconds and once at the end. Kept because exports and
+  older tooling read it, and because a site scraped by an earlier version only
+  has this.
+
+`main.py` reads through `_read_all_products()` / `_load_scraped_urls()`, which
+prefer the JSONL and fall back to the legacy JSON. `app.py` reads through
+`load_products_from_cache()`, which does the same.
+
+Things worth knowing before touching this:
+
+- **A torn final line is normal, not corruption.** The file is appended to
+  live, so a reader can catch a half-written last line. Both readers skip it
+  and keep the rest — losing one product is recoverable, losing the catalogue
+  is not. Never make a parse failure fatal here.
+- **`app.py`'s cache is incremental.** It remembers the byte offset it reached
+  and parses only the tail on each poll; re-reading the whole file twice a
+  second would make the dashboard cost O(catalogue). A file that has *shrunk*
+  means it was rewritten (a fresh scrape, `--no-resume`), so the offset is
+  reset rather than trusted.
+- **`ProgressReporter` throttles** `data/progress.json` to one write a second.
+  The final update passes `force=True`; without it a finished run shows one
+  short forever.
+- **`cache/html/`** holds gzipped page bodies keyed by a hash of the URL,
+  written through a temp file. A corrupt entry counts as a miss rather than
+  raising — a run killed mid-write used to leave a truncated `.gz` that every
+  later run would try, and fail, to read.
+
+## Stores that will not quote a price
+
+Some storefronts render the whole product page — title, images, description —
+but omit the price and report every item out of stock until the request says
+how the goods would be delivered. Scraped naively, such a catalogue comes back
+100% sold out with no prices at all.
+
+`main.py`'s `recover_missing_price()` re-fetches a priceless product with each
+of `client.PRICE_CONTEXT_PARAMS` until one yields a price, and
+`client.CONTEXT_MEMO` remembers the answer per host so the discovery is paid
+once rather than per product. The probe URL is *not* kept on the record: the
+parameter is how we asked, not where the product lives, and it must not reach
+the exported feed.
+
+Traps here, all of which cost real prices when got wrong:
+
+- **The remembered answer must not be the *only* one tried.** One storefront
+  can stock the same catalogue under several fulfilment modes; a product absent
+  from the remembered mode may still be priced under another. `candidates()`
+  returns the known set *first* and the alternates behind it, retiring the
+  alternates only after they have failed to pay off across several products
+  (`credit()` resets that counter whenever one does).
+- **First writer wins in `remember()`.** Workers run concurrently and finish
+  out of order; letting the last one overwrite made the recorded answer a
+  matter of timing, and the log claim two different answers for one host.
+- Probing stops after `_CONTEXT_PROBE_LIMIT` fruitless products, so a store
+  whose stock genuinely *is* exhausted does not double its request count.
+- A product with no price is a perfectly ordinary outcome. Anything that fails
+  leaves the original record untouched.
+
 ## Known issues / gotchas (found while working in this repo, not yet fixed)
 
-1. **The periodic flush is O(n²).** `save_results()` rewrites the whole of
-   `products.json` every 10 completions. Over a full 3,353-product run that's
-   ~335 rewrites of a file growing toward ~50MB — several GB of cumulative
-   disk writes. Works fine, just wasteful; fix by appending incrementally or
-   flushing on a time interval if it becomes a problem.
+1. ~~The periodic flush is O(n²).~~ **Fixed.** Products are appended to
+   `products.jsonl` one line at a time as they are scraped; `products.json` is
+   now only a periodic snapshot (`SNAPSHOT_INTERVAL`, 20s) plus a final write.
+   See "Product storage" below.
 2. `image.png` in the repo root (added by a recent upstream commit) is just a
    README screenshot, not app data.
 3. `check_fields.py`, `test_brand.py`, `test_client.py`, `test_product.py` at

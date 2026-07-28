@@ -128,7 +128,75 @@ def load_json_cached(path, default):
         logger.error(f"Error reading {path}: {e}")
         return default
 
+def load_products_jsonl(path):
+    """Products from an append-only .jsonl, reading only what is new.
+
+    The scraper appends one line per product as it goes, so during a run this
+    file grows every few seconds. Re-reading all of it on every poll would make
+    the dashboard cost O(catalogue) twice a second; instead the byte offset
+    reached last time is remembered and only the tail is parsed.
+
+    A re-scrape appends rather than rewriting, so a URL can appear more than
+    once and the latest line wins. The final line may be half-written at the
+    moment we read it — the scraper is still appending — so a line that does
+    not parse is left for the next poll rather than treated as corruption.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+
+    entry = _CACHE.get(path)
+    # A shrunken file means it was rewritten (a fresh scrape, or --no-resume),
+    # so the remembered offset would point into the middle of a new record.
+    if entry is None or size < entry.get('offset', 0):
+        entry = {'data': [], 'by_url': {}, 'offset': 0, 'mtime': 0}
+
+    if size > entry['offset']:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                f.seek(entry['offset'])
+                consumed = entry['offset']
+                for line in f:
+                    if not line.endswith('\n'):
+                        break  # torn tail; the writer has not finished it yet
+                    consumed += len(line.encode('utf-8'))
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except ValueError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    url = record.get('url')
+                    if url and url in entry['by_url']:
+                        entry['data'][entry['by_url'][url]] = record
+                    else:
+                        if url:
+                            entry['by_url'][url] = len(entry['data'])
+                        entry['data'].append(record)
+                entry['offset'] = consumed
+        except OSError as e:
+            logger.error(f"Error reading {path}: {e}")
+            return entry['data']
+
+    _CACHE[path] = entry
+    return entry['data']
+
+
 def load_products_from_cache():
+    """Every product for the active site.
+
+    products.jsonl is the scraper's live, append-only record; products.json is
+    the periodic snapshot it also writes, and what older scrapes left behind.
+    The JSONL is preferred when present so the dashboard reflects a run in
+    progress instead of lagging a snapshot behind.
+    """
+    jsonl = site_file('products.jsonl')
+    if jsonl and os.path.exists(jsonl):
+        return load_products_jsonl(jsonl)
     return load_json_cached(site_file('products.json'), [])
 
 def load_categories_from_cache():
