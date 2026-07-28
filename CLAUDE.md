@@ -1,0 +1,402 @@
+# CLAUDE.md
+
+Guidance for Claude Code (or any future contributor) working in this repository.
+
+## What this project is
+
+`webscrapper` is a **general-purpose e-commerce scraper** and data-management
+dashboard for WordPress/WooCommerce storefronts. Point it at any URL on a store
+and it discovers that store's whole catalogue from its sitemaps, extracts
+structured product data (title, price, brand, categories, images,
+descriptions), downloads images, and writes everything to disk. A Flask backend
+exposes the data and scraper controls over a REST API; a React (Vite)
+single-page app consumes that API as a dashboard.
+
+It is **not tied to any one store** — nothing about a specific site should be
+hardcoded. Multiple stores can be scraped and kept side by side.
+
+There is no database. Each store owns a folder under `data/<domain>/`, and
+`products.json` / `categories.json` inside it are the source of truth, loaded
+into memory and cached by the backend. The dashboard displays one store at a
+time — the "active" site, recorded in `data/.active_site`.
+
+GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
+
+## Tech stack
+
+**Backend** — `app.py` (Flask, single file, ~800 lines)
+- Flask + Flask-CORS, serves both the REST API and the compiled React build
+  (`frontend/dist`) as static files, single process.
+- `curl_cffi` (`impersonate="chrome"`) for all outbound HTTP — this is what
+  bypasses Cloudflare's bot detection. Do not swap in plain `requests`; it
+  will get blocked.
+- `BeautifulSoup4` + `lxml` for HTML parsing, `markdownify` for converting
+  long descriptions to Markdown, `pandas`/`openpyxl` for Excel export.
+- Dev server via `python app.py` (Windows-friendly). README also documents
+  `gunicorn` as a Linux/macOS "production" option — **gunicorn does not run
+  natively on Windows**, so on this machine always use `python app.py`.
+
+**Scraper** — `main.py` + `scraper/` package
+- `scraper/client.py` — `ScraperClient`: sync and async page fetchers via
+  `curl_cffi`. Never raises — the sync `fetch_page` returns `None`, the async
+  `fetch_page_async` returns `(None, reason)` so callers can record *why* a URL
+  was missed.
+
+  **Browser-fingerprint escalation is the important part here.** A single
+  hardcoded `impersonate="chrome"` silently loses whole stores: several hosts
+  (anything behind the `hcdn` edge) answer Chrome's TLS/JA3 fingerprint with a
+  403 "Checking your browser" interstitial and serve the identical request
+  happily under Safari. So a fetch walks `IMPERSONATE_PROFILES`
+  (chrome → safari → firefox), and `PROFILE_MEMO` remembers the first profile
+  that worked **per host**, so the cost is paid once per host rather than once
+  per URL. Consequences worth knowing:
+    - **403 is deliberately NOT in `PERMANENT_STATUSES`.** It signals a
+      fingerprint block far more often than a genuinely forbidden resource.
+      Putting it back makes every `hcdn`-fronted store fail instantly again.
+    - `looks_like_challenge()` catches bot walls that answer **200** with an
+      interstitial; without it those get parsed as if they were products.
+    - After `_EXHAUSTED_AFTER` (3) URLs on a host fail *every* profile, the
+      ladder collapses to one profile for that host. Without this, a genuinely
+      blocked site turns a 3,000-URL run into 27,000 requests.
+    - Only a *fingerprint* rejection counts towards that — a timeout says
+      nothing about which browser we look like. Hence `record_failure(blocked=)`.
+    - `normalize_url()` percent-encodes non-ASCII paths; Shopify handles
+      routinely contain `®`/`™` and curl rejects them raw.
+- `scraper/extractors.py` — platform-neutral readers for schema.org JSON-LD,
+  Open Graph meta tags and microdata, plus price/entity normalisation. No I/O,
+  never raises. `jsonld_nodes()` flattens `@graph` and `mainEntity` nesting and
+  tolerates the ways real sites break JSON-LD (CDATA wrappers, HTML comments,
+  trailing commas).
+- `scraper/schema.py` — **the single definition of a product record.**
+  `CORE_FIELDS` (the original eight) + `DETAIL_FIELDS` (`price_value`,
+  `currency`, `sku`, `availability`, `in_stock`), with `extracted_by` marked
+  diagnostic and never exported. `normalize()` guarantees types;
+  `export_row()` flattens to strings. **`app.py` imports this** — adding a
+  field is a one-line change here, and it is no longer possible to forget an
+  exporter. (The XML exporter used to serialise whatever keys a record
+  happened to carry, so a new dict-valued field landed in the feed as a Python
+  repr inside a tag.)
+- `scraper/parser.py` — `Parser`: pure static methods, no I/O. Parses sitemap
+  XML for `<loc>` URLs, and parses a product page into a record.
+
+  **Extraction is layered, ordered by how universal each layer is:**
+  schema.org structured data (JSON-LD, then microdata) → Open Graph meta tags
+  → theme CSS selectors. Each field independently takes the first layer that
+  yields a value, so a store publishing half its data as JSON-LD and the rest
+  only in markup still comes out complete.
+
+  This ordering is the whole point: the parser used to key *only* off default
+  WooCommerce class names, which returned an empty record on Shopify,
+  Django-Oscar, Magento, Next.js storefronts and any customised Woo theme —
+  every one of which publishes schema.org data because Google rich results
+  depend on it. Selector tables (`TITLE_SELECTORS`, `PRICE_SELECTORS`, …) are
+  now the *fallback*, which is why it is safe for them to be broad.
+
+  `extracted_by` on each record names the layer that won per field — the
+  fastest way to tell "this store needs new selectors" from "this store
+  blocked us". Check it first when a scrape looks wrong.
+
+  Traps already handled, easy to reintroduce:
+    - The last breadcrumb is the product itself; left in, it becomes a
+      category, and then a directory per product in `structured/`.
+    - JSON-LD payloads are full of HTML entities (`Home &amp; Living`) — hence
+      `extractors.unescape`, applied twice for `&amp;amp;`.
+    - Stores that put their **own name** in the JSON-LD `brand` field collapse
+      the whole catalogue to one brand, so a brand matching the site's domain
+      is rejected and the next layer gets a turn.
+    - Galleries contain placeholders, spacers and trust badges (`_JUNK_IMAGE_TOKENS`),
+      and lazy-loading themes hide the real URL in one of ~10 `data-*`
+      attributes or the largest `srcset` candidate.
+- `scraper/downloader.py` — `ImageDownloader`: async image downloads with a
+  semaphore for concurrency control, skips files that already exist on disk
+  (resumable). **It takes the shared `ScraperClient`** and fetches through
+  `fetch_bytes_async`, so images use whichever browser fingerprint works for
+  that host. Downloading them over a separate hardcoded-Chrome session meant a
+  fingerprint-blocked store scraped perfectly and yielded *none* of its
+  pictures — the product pages escalated to Safari, the images did not.
+- `scraper/paths.py` — **all filesystem-name safety, in one place**, because
+  the scraper and the downloader have to agree: how long an image filename may
+  be depends on the directory the scraper chose for the product.
+  - Sanitising each segment is not enough; the limit is on the **total** path.
+    `build_product_dir()` budgets the whole thing, dropping the deepest
+    category first (losing "Switches" hurts less than losing the product's
+    identity) and only then squeezing the product folder. `image_path()`
+    fits the filename into whatever room is left, returning `''` when even a
+    minimal name will not fit so the caller skips rather than fails on open().
+  - **Truncation always appends a short hash.** Two long titles sharing a
+    prefix ("… 4GB 128GB Black" / "… 8GB 256GB Blue") would otherwise collapse
+    onto one directory and overwrite each other.
+  - Windows reserved names (`CON`, `PRN`, `LPT1`, …) are escaped.
+  - `MAX_PATH` is enforced on every platform, not just Windows: `data/` gets
+    copied to and served from Windows machines, so a tree that only works on
+    Linux is a trap.
+- `main.py` — orchestrates: discover product URLs → scrape concurrently with
+  `asyncio` + a `Semaphore(workers)` → write
+  `data/<site>/structured/<category>/<product>/` with `data.json`,
+  `description.md`, `short_description.txt`, `images/`. Flushes
+  `products.json` / `categories.json` / `failed_urls.json` every 10
+  completions plus a final write. Progress goes to `data/progress.json`
+  (`{current, total, eta}`), which the frontend polls for the live progress
+  bar. Logs to stdout and `scraper.log`. CLI:
+  `python main.py --target_url URL [--limit N] [--workers 8] [--no-resume] [--single-product] [--new-version]`.
+
+  **A run must always reach the end, or be stopped by the user — nothing else.**
+  Several things enforce that, and removing any one of them reintroduces
+  silent partial scrapes:
+    - `scrape_product()` is a thin wrapper that catches everything and records
+      the URL as failed; the real work is in `_scrape_product_inner()`.
+      Product pages are wildly inconsistent and *will* throw.
+    - `asyncio.gather(..., return_exceptions=True)` — without this one
+      unhandled task exception abandons every remaining product.
+    - `write_json_atomic()` (temp file + `os.replace`) — these files are
+      rewritten every few seconds while the dashboard polls them; writing in
+      place lets a reader parse a half-written file.
+    - `scraper/paths.py` — titles and image URLs go straight into paths.
+      Windows caps paths at 260 chars and rejects a set of characters
+      outright; unsanitised names silently lose images and whole products.
+    - A manual stop is logged to `scraper.log` by `app.py`'s stop endpoint, so
+      a stopped run is distinguishable from a crash after the fact.
+
+- `scraper/discovery.py` — platform fingerprinting and product-URL discovery,
+  shared by the scraper and the dashboard's pre-scrape analysis. Two entry
+  points: `analyze_site()` (fast, ~4 requests, used while a dialog is open)
+  and `discover_products()` (exhaustive, used at scrape time).
+
+  **Discovery is layered and additive**, because no single strategy works
+  everywhere and stores are often inconsistent with themselves:
+  sitemaps → platform API (Shopify `/products.json`, WooCommerce Store API,
+  WP REST) → listing-page crawl as a last resort. Results are **merged, not
+  first-wins** — on the reference store the sitemaps yield 3,353 URLs and the
+  WooCommerce API 3,400, and the union is what gets scraped. If you make this
+  "first strategy that returns something wins", you will silently lose products.
+
+  Traps already handled here, easy to reintroduce:
+    - **Never put `'item'` in `PRODUCT_SITEMAP_HINTS`** — the word "sitemap"
+      contains "item", so it matches every sitemap on the site.
+    - `product_cat-`, `product_tag-`, `pa_*-` sitemaps list category / tag /
+      attribute *archive* pages, not products (`TAXONOMY_SITEMAP_HINTS`).
+    - `/shop/` and `/store/` are deliberately absent from `PRODUCT_URL_HINTS`
+      — they match catalogue indexes far more often than products.
+    - WordPress theme/plugin names are parsed from asset URLs with a strict
+      slug charset; a loose pattern picks up `*` and template placeholders.
+    - `_is_scrapable_page()` drops what sitemaps list alongside products:
+      images on a media host, PDFs, blog and account pages, off-host URLs —
+      and **the site root**, which appears in product sitemaps more often than
+      you would hope. Scraped, the homepage becomes a record titled after the
+      store, which then counts as "already done" on every later run.
+    - `_infer_product_urls()` handles stores publishing one undifferentiated
+      `sitemap.xml` with no `product-sitemap.xml` to key off: it groups URLs by
+      first path segment and takes the segment that both looks like a product
+      path and dominates the file (≥66%). It returns `[]` rather than guessing
+      when nothing dominates, so a flat-URL site falls through to the other
+      strategies instead of scraping its About page.
+    - OpenCart stores are usually run with SEO URLs on, so products carry no
+      `product_id=` anywhere — `discover_via_opencart` harvests the stock
+      listing markup (`.product-thumb a`, `.product-layout a`, …) via the
+      `product/search` route, and strips the paging params off each link so the
+      same product isn't scraped once per originating page.
+    - `discover_via_crawl` is a bounded BFS, not a pagination-only follow:
+      storefronts that render their homepage in JavaScript expose no product
+      link until you reach a category page, and their category URLs are bare
+      slugs with nothing to pattern-match on. Listing-looking pages are
+      visited first; if hint-matching finds nothing, the dominant shape of
+      everything collected is inferred instead.
+
+  **Resume** is on by default: `load_existing_products()` reads the previous
+  `products.json` and skips URLs already scraped, so a re-run fills in only
+  what's missing and a crash is recoverable. Records with no `title` are
+  treated as not-done, which self-heals junk rows. Pass `--no-resume` to
+  force a full re-scrape.
+
+  **Failures are recorded, never silent.** `fetch_page_async` returns
+  `(html, reason)`; anything that fails all retries is appended to
+  `state['failed']` and written to `data/failed_urls.json`, with a warning
+  logged at the end. Re-running retries them automatically (they aren't in
+  `products.json`, so resume doesn't skip them).
+
+**Frontend** — `frontend/` (React 19, Vite, Tailwind CSS v4, lucide-react icons)
+- Single-file app: `frontend/src/App.jsx` (~800 lines, no router, no state
+  library — plain `useState`/`useEffect`, polling via `setInterval`).
+- Tailwind v4 is configured via CSS (`@import "tailwindcss"` +  `@theme` block
+  in `frontend/src/index.css`), not the classic JS-only config. A
+  `tailwind.config.js` also exists (legacy/belt-and-braces) with the same
+  color palette duplicated — **if you add a new theme color, update both
+  places** or the CSS `@theme` block alone (that one is authoritative).
+- Custom design system lives in `index.css` under `@layer components`:
+  `.panel`, `.form-input`, `.btn`/`.btn-primary`/`.btn-danger`/
+  `.btn-outline-primary`/`.btn-outline-secondary`, `.badge` +
+  `.badge-success`/`.badge-danger`/`.badge-warning`/`.badge-secondary`,
+  `.terminal`. **Important Tailwind v4 gotcha**: class names must appear as
+  full literal strings somewhere in the source for the compiler to pick them
+  up — never build a class name via string concatenation/interpolation
+  (e.g. `` `bg-${color}/10` ``). Always keep a static lookup object whose
+  *values* are complete class strings (see `SERVICE_STATUS_META` /
+  `STATUS_ICONS` in `App.jsx` for the pattern used throughout this codebase).
+- Dark mode: manual, via a `dark` class toggled on `<html>`, persisted to
+  `localStorage['theme']`, defaulting to the OS preference.
+- `frontend/dist` is the production build Flask serves at `/`; it is
+  git-ignored and must be rebuilt after any frontend change:
+  ```bash
+  cd frontend && npm run build
+  ```
+
+## Local setup (Windows, this machine)
+
+```bash
+python -m venv venv
+./venv/Scripts/python.exe -m pip install flask flask-cors beautifulsoup4 lxml curl_cffi aiofiles markdownify pandas openpyxl
+cd frontend && npm install && npm run build && cd ..
+./venv/Scripts/python.exe app.py
+# → http://127.0.0.1:5000
+```
+
+There is no `requirements.txt` — dependencies are only documented in the
+README's `pip install` line. If you add a new Python dependency, update the
+README's install command (there's nowhere else it's tracked).
+
+## Multi-site data layout
+
+```
+data/
+├── .active_site                  # which site the dashboard shows (plain text)
+├── .exports/                     # scratch space for generated xlsx/xml/zip
+├── progress.json                 # live run state, global to whichever scrape is running
+├── example-store.com/            # one folder per store, named after its domain
+│   ├── products.json
+│   ├── categories.json
+│   ├── failed_urls.json
+│   └── structured/<Category>/<Product>/{data.json,description.md,short_description.txt,images/}
+└── example-store.com_v2_20260728-014500/   # re-scrape kept as a separate version
+```
+
+Folder naming lives in `main.py`: `site_folder_name()` lowercases the host and
+strips a leading `www.`, so `https://www.foo.com/x` and `https://foo.com` map
+to the same folder. `resolve_site_dir(url, new_version=True)` allocates
+`<site>_v2_<timestamp>`, `_v3_`, … instead of touching the existing folder.
+
+On the backend everything reads through `active_site_dir()` /
+`site_file(name)` — **never** `os.path.join(DATA_DIR, 'products.json')`
+directly, or you'll break multi-site. `site_file()` returns `''` (not `None`)
+when nothing has been scraped, so `os.path.exists()` treats it as missing.
+`_CACHE` is keyed by full path so switching sites can't serve stale data.
+
+Dotfiles are filtered out of `/api/files`, keeping `.active_site` and
+`.exports/` out of the File Explorer.
+
+**Exports run as background jobs.** A full image archive is thousands of files
+and hundreds of megabytes — far too slow to hold a request open for, and the
+UI would look hung. `/api/export/start` spawns a thread, the client polls
+`/api/export/status/<id>` for a step counter and a live message (archive
+packing reports every 50 files), then fetches `/api/export/download/<id>`.
+The browser is sent to the download URL directly rather than buffering a
+blob, so a 700MB file streams to disk instead of into memory. Finished jobs
+and their files are purged after an hour, and `.exports/` is scratch space —
+safe to delete at any time.
+
+## API surface (all under `app.py`)
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/` | GET | Serves the built React `index.html` |
+| `/api/scrape` | POST | Launches `main.py` as a subprocess (`{url, limit, workers}`) |
+| `/api/scrape/stop` | POST | Terminates the running scraper subprocess |
+| `/api/status` | GET | `{running, pid}` — is a scrape currently active |
+| `/api/system/status` | GET | Full health report, see below |
+| `/api/system/wipe` | POST | Deletes every site folder, cache and the log. Refuses (409) while a scrape is running |
+| `/api/sites` | GET | All scraped sites with product/failure counts and which is active |
+| `/api/sites/active` | POST | Switch which site the dashboard shows |
+| `/api/site/check` | GET | `?url=` → whether that store already has data; drives the update-vs-new-version prompt |
+| `/api/site/analyze` | GET | `?url=` → platform, theme, plugins, sitemaps, APIs, estimated product count. Advisory only — never blocks a scrape |
+| `/api/export/bundle` | POST | Synchronous export. Kept for scripting; the dashboard uses the job endpoints below |
+| `/api/export/start` | POST | `{sites[], formats[], clean}` → `{job_id}`, work runs on a background thread |
+| `/api/export/status/<job_id>` | GET | `{state, step, total_steps, message, filename, size}` — polled for the progress dialog |
+| `/api/export/download/<job_id>` | GET | Serves the finished file; jobs expire after `EXPORT_JOB_TTL` (1h) |
+| `/api/sites/delete` | POST | `{names[]}` or `{all: true}`. Refuses (409) while a scrape runs; repoints the active site if it was deleted |
+| `/api/logs` | GET | Tail of `scraper.log` (`?lines=N`) |
+| `/api/progress` | GET | Contents of `data/progress.json` |
+| `/api/products` | GET | Paginated/filterable product list (`page`, `limit`, `search`, `category`) |
+| `/api/stats` | GET | Totals: products/categories/brands/images |
+| `/api/files` | GET | File-tree listing under `data/` (path-traversal guarded) |
+| `/api/image` | GET | Resolves a product image by title+filename across old/new storage layouts |
+| `/data/<path>` | GET | Raw static file serving from `data/` |
+| `/api/export/json`, `/csv`, `/excel`, `/xml` | GET | Full product export, `?clean=true\|false` strips/keeps raw HTML in descriptions |
+| `/api/export/categories`, `/categories_csv`, `/brands_csv` | GET | Metadata list exports |
+| `/api/export/structured`, `/structured/data`, `/structured/images` | GET | ZIP archives of `data/structured/` (everything / data-only / images-only) |
+
+A module-level `_CACHE` dict memoizes `products.json`/`categories.json` in
+memory, invalidated by file mtime (`load_products_from_cache()` /
+`load_categories_from_cache()`) — every endpoint that reads product data goes
+through these, not raw file reads. If you add a new endpoint that reads
+products, use these helpers rather than reopening the JSON file.
+
+## System Status feature (added on the `joe` branch)
+
+A new dashboard page (sidebar → "System Status", `Activity` icon with a
+colored health dot that's always visible regardless of which view is open)
+that reports the health of every moving part of the app:
+
+- **Backend API** — trivially "operational" (if the handler ran, Flask is up); reports process uptime.
+- **Scraper Engine** — "active" while a scrape subprocess is running, "operational" (idle) otherwise.
+- **Data Storage** — checks `data/` exists and is writable, reports indexed product count.
+- **Frontend Build** — checks `frontend/dist/index.html` exists, reports its build timestamp.
+- **Logging** — checks `scraper.log` exists, reports size and time since last write.
+- **Target site** — a genuine outbound reachability check against *the active
+  site's* domain (`target_site_domain()` strips any `_v2_<timestamp>` suffix);
+  reports "No site scraped yet" when `data/` is empty. Runs on a **daemon
+  background thread** on a 60-second interval (`_check_target_site_loop` in
+  `app.py`), cached in a lock-guarded module dict. Deliberately **not** done
+  inline in the request handler — a live network call in a single-threaded
+  Flask dev server would stall every other request while it waited.
+- **Disk Space** — `shutil.disk_usage()` on the app's drive; "warning" below
+  10% free, "down" below 3% free.
+- **Python Runtime** — version and OS, always "operational".
+
+Backend: `GET /api/system/status` → `{overall, checked_at, services: [...]}`
+where each service is `{id, name, category, icon, status, detail,
+checked_at?}`. `status` is one of `operational | active | checking | warning
+| down`; `overall` is the worst of all services, collapsed to
+`operational | degraded | down`.
+
+Frontend: polled on the same 2-second interval as the rest of the dashboard
+(`fetchSystemStatus`, alongside `fetchLogs`/`fetchProgress`/`fetchStatus`).
+Icon-per-service and color-per-status are static lookup tables
+(`STATUS_ICONS`, `SERVICE_STATUS_META`) in `App.jsx` — extend those, not a
+computed class name, when adding a new service or status.
+
+## Known issues / gotchas (found while working in this repo, not yet fixed)
+
+1. **The periodic flush is O(n²).** `save_results()` rewrites the whole of
+   `products.json` every 10 completions. Over a full 3,353-product run that's
+   ~335 rewrites of a file growing toward ~50MB — several GB of cumulative
+   disk writes. Works fine, just wasteful; fix by appending incrementally or
+   flushing on a time interval if it becomes a problem.
+2. `image.png` in the repo root (added by a recent upstream commit) is just a
+   README screenshot, not app data.
+3. `check_fields.py`, `test_brand.py`, `test_client.py`, `test_product.py` at
+   the repo root are ad hoc manual scripts (no test runner, no assertions
+   framework) — run directly with the venv's Python for spot-checking parser
+   output, not part of any CI.
+4. No CI exists. There are two self-contained, offline, no-dependency suites —
+   run them after any change to the scraper or the exporters:
+   ```bash
+   ./venv/Scripts/python.exe test_robustness.py   # parsing, path budget, discovery filters
+   ./venv/Scripts/python.exe test_exports.py      # schema + all four export builders
+   ```
+   `test_robustness.py` covers the hostile inputs real stores produce
+   (truncated JSON-LD, entity-encoded names, price ranges, galleries of
+   tracking pixels) and asserts the parser never raises. `test_exports.py`
+   feeds every builder a current record, a **legacy** record with none of the
+   new fields, and a junk record with wrong types — the legacy case is what
+   guarantees `products.json` files scraped by an older version still export.
+   Neither makes a network request, so both run in about a second.
+5. `pyrightconfig.json` points Pyright at `./venv` — if you recreate the venv
+   elsewhere this needs to match.
+
+## Branching / workflow notes for this repo
+
+- Default branch: `main`.
+- `joe` — working branch for dashboard feature work (created for the System
+  Status page). Push here rather than to `main` unless told otherwise.
+- Commit messages in this repo do not currently follow a strict convention
+  (mix of `feat:`/`fix:`/`docs:` prefixes and plain descriptions) — either is
+  fine, prefer a `type: summary` first line when the change fits a clear category.
