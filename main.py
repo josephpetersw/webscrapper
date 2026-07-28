@@ -9,6 +9,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from scraper.client import ScraperClient
+from scraper import client
 from scraper.parser import Parser
 from scraper.downloader import ImageDownloader
 from scraper import discovery
@@ -160,6 +161,45 @@ def mark_completed(state, url, note):
 safe_path_segment = paths_util.safe_path_segment
 
 
+async def recover_missing_price(data, url, async_session, parser, state):
+    """Re-fetch a priced-but-priceless product with a fulfilment context.
+
+    Some storefronts render the whole product page — title, images, description
+    — but omit the price until the request states how the goods would be
+    delivered, reporting the item as out of stock in the meantime. A catalogue
+    scraped without that looks entirely sold out.
+
+    The parameter that unlocks it is discovered once per host and then reused
+    (see client.CONTEXT_MEMO), so this costs one extra request per host in the
+    normal case, not one per product. Anything that fails leaves the original
+    record untouched: a product with no price is a perfectly ordinary outcome.
+    """
+    if data.get('price') or data.get('price_value') is not None:
+        client.CONTEXT_MEMO.settle(client._host_of(url))
+        return data
+
+    host = client._host_of(url)
+    for params in client.CONTEXT_MEMO.candidates(host):
+        probe_url = client.with_params(url, params)
+        try:
+            html, _ = await state['client'].fetch_page_async(
+                async_session, probe_url, retries=1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+        if not html:
+            continue
+        retried = parser.parse_product(html, url)
+        if retried and (retried.get('price') or retried.get('price_value') is not None):
+            client.CONTEXT_MEMO.remember(host, params)
+            # Keep the original URL: the parameter is how we asked, not where
+            # the product lives, and it must not end up in the exported feed.
+            retried['url'] = url
+            return retried
+    return data
+
+
 async def scrape_product(url, async_session, parser, downloader, semaphore, state):
     """Scrape one product. Never raises - a single bad page must not end the run."""
     try:
@@ -189,6 +229,8 @@ async def _scrape_product_inner(url, async_session, parser, downloader, semaphor
             state['failed'].append({'url': url, 'reason': 'no product data found in page'})
             mark_completed(state, url, 'No data')
             return None
+
+        data = await recover_missing_price(data, url, async_session, parser, state)
 
         # Category trail + product folder, budgeted so there is still room for
         # the image filenames underneath it.

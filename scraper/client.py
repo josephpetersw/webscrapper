@@ -21,7 +21,7 @@ import logging
 import random
 import threading
 import time
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
@@ -55,6 +55,28 @@ THROTTLE_STATUSES = (429,)
 DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF = 2.0
 DEFAULT_TIMEOUT = 30
+
+# Query parameters that make a storefront commit to a fulfilment context.
+#
+# Some stores serve a product page whose price is simply absent until the
+# request says how the goods would be delivered — the page renders, the title
+# and images are all there, and schema.org reports the item as out of stock with
+# no offer price. Left alone that yields a catalogue where every product looks
+# unavailable, which is indistinguishable from a genuinely sold-out store.
+#
+# Each entry is tried once per host, only after a product has come back priced
+# but incomplete, and the one that works is remembered for the rest of the run.
+# These are ordinary public parameters the storefront's own links carry.
+PRICE_CONTEXT_PARAMS = (
+    {'sid': 'SLOTTED'},     # scheduled-delivery slot
+    {'sid': 'EXPRESS'},     # immediate delivery
+    {'fulfillment': 'delivery'},
+    {'deliveryMode': 'delivery'},
+)
+
+# Give up probing a host after this many products fail to gain a price, so a
+# store whose stock really is exhausted does not double its request count.
+_CONTEXT_PROBE_LIMIT = 4
 
 
 BACKOFF_CAP = 30.0
@@ -213,6 +235,70 @@ class _ProfileMemo:
 
 
 PROFILE_MEMO = _ProfileMemo()
+
+
+class _ContextMemo:
+    """Remembers which fulfilment parameters a host needs before it will price.
+
+    Same shape as the fingerprint memo, and for the same reason: the answer is a
+    property of the host, so it is worth discovering once and then applying to
+    every remaining URL rather than re-deriving it per product.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._known = {}      # host -> params that produced a price
+        self._probes = {}     # host -> how many products we have probed
+        self._settled = set()  # hosts needing nothing, or proven hopeless
+
+    def known(self, host):
+        with self._lock:
+            return self._known.get(host)
+
+    def remember(self, host, params):
+        if not host:
+            return
+        with self._lock:
+            self._known[host] = params
+            self._settled.add(host)
+        logger.info(f"{host} only prices products with {params} — "
+                    f"applying that to the rest of this run")
+
+    def candidates(self, host):
+        """Parameter sets still worth trying for this host, or []."""
+        if not host:
+            return []
+        with self._lock:
+            if host in self._known:
+                return [self._known[host]]
+            if host in self._settled:
+                return []
+            if self._probes.get(host, 0) >= _CONTEXT_PROBE_LIMIT:
+                self._settled.add(host)
+                logger.debug(f"{host}: no fulfilment parameter restored prices; "
+                             f"treating missing prices as genuine")
+                return []
+            self._probes[host] = self._probes.get(host, 0) + 1
+        return list(PRICE_CONTEXT_PARAMS)
+
+    def settle(self, host):
+        """Record that this host needs nothing — prices arrive unprompted."""
+        if host:
+            with self._lock:
+                self._settled.add(host)
+
+
+CONTEXT_MEMO = _ContextMemo()
+
+
+def with_params(url, params):
+    """Same URL with extra query parameters, leaving existing ones intact."""
+    if not params:
+        return url
+    parts = urlparse(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update(params)
+    return urlunparse(parts._replace(query=urlencode(query)))
 
 
 class ScraperClient:

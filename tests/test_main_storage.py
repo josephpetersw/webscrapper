@@ -8,19 +8,38 @@ import pytest
 
 import app as app_module
 import main as main_module
+from scraper import paths as product_paths
 
 
 # ── Path slugging ────────────────────────────────────────────
+# Slugging moved into scraper/paths.py so main.py and app.py cannot drift; the
+# old main._safe_component is now paths.safe_path_segment, re-exported by
+# main.py as safe_path_segment.
 
 @pytest.mark.parametrize('raw,expected', [
     ('Realme 5 (128GB + 4GB RAM)', 'Realme_5_128GB_4GB_RAM'),
     ('Realme Buds Air 2', 'Realme_Buds_Air_2'),
     ('  leading & trailing  ', 'leading_trailing'),
-    ('---', ''),
     ('Smartphones', 'Smartphones'),
 ])
-def test_safe_component(raw, expected):
-    assert main_module._safe_component(raw) == expected
+def test_safe_path_segment(raw, expected):
+    assert product_paths.safe_path_segment(raw) == expected
+
+
+def test_segment_with_nothing_usable_is_named_not_empty():
+    """An empty string would make os.path.join silently drop the level, putting
+    the product in its parent category's folder; 'unnamed' keeps it separate."""
+    assert product_paths.safe_path_segment('---') == 'unnamed'
+    assert product_paths.safe_path_segment('') == 'unnamed'
+
+
+def test_long_segments_are_capped_but_stay_distinct():
+    """Two configurations of one product share a long prefix. Truncating without
+    a disambiguator would land them in the same folder and overwrite each other."""
+    a = product_paths.safe_path_segment('Samsung Galaxy A06 4GB RAM 128GB Black Edition', 40)
+    b = product_paths.safe_path_segment('Samsung Galaxy A06 4GB RAM 128GB Green Edition', 40)
+    assert len(a) <= 40 and len(b) <= 40
+    assert a != b
 
 
 @pytest.mark.parametrize('raw', [
@@ -31,8 +50,12 @@ def test_safe_component(raw, expected):
 ])
 def test_app_and_main_slugging_stay_identical(raw):
     """app.py serves images out of folders main.py created. If these two ever
-    disagree the dashboard shows broken thumbnails for every product."""
-    assert app_module._safe_component(raw) == main_module._safe_component(raw)
+    disagree the dashboard shows broken thumbnails for every product.
+
+    They now share one implementation, so this asserts the sharing is real —
+    that neither module has quietly grown its own copy again."""
+    assert main_module.safe_path_segment(raw) == product_paths.safe_path_segment(raw)
+    assert app_module.product_paths.safe_path_segment(raw) == product_paths.safe_path_segment(raw)
 
 
 def test_structured_dir_nests_by_category(main_mod):

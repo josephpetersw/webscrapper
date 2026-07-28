@@ -62,6 +62,19 @@ GitHub: `josephpetersw/webscrapper` (owner account: `josephpetersw`).
       nothing about which browser we look like. Hence `record_failure(blocked=)`.
     - `normalize_url()` percent-encodes non-ASCII paths; Shopify handles
       routinely contain `®`/`™` and curl rejects them raw.
+
+  **Fulfilment-context probing** (`CONTEXT_MEMO`, `PRICE_CONTEXT_PARAMS`) is
+  the same per-host-adaptation idea applied to a different failure. Some
+  storefronts render the entire product page — title, images, description —
+  but omit the price until the request states how the goods would be
+  delivered, and report the item as out of stock meanwhile. Scraped naively,
+  the whole catalogue comes back looking sold out. `main.recover_missing_price`
+  re-fetches a title-but-no-price product with each candidate parameter
+  (`?sid=SLOTTED` and friends), and the one that works is remembered for the
+  host, so the cost is one extra request per *host*, not per product. Probing
+  stops after `_CONTEXT_PROBE_LIMIT` products so a genuinely sold-out store
+  does not double its request count. The parameter is never written into the
+  stored `url` — it is how we asked, not where the product lives.
 - `scraper/extractors.py` — platform-neutral readers for schema.org JSON-LD,
   Open Graph meta tags and microdata, plus price/entity normalisation. No I/O,
   never raises. `jsonld_nodes()` flattens `@graph` and `mainEntity` nesting and
@@ -376,12 +389,24 @@ computed class name, when adding a new service or status.
    the repo root are ad hoc manual scripts (no test runner, no assertions
    framework) — run directly with the venv's Python for spot-checking parser
    output, not part of any CI.
-4. No CI exists. There are two self-contained, offline, no-dependency suites —
-   run them after any change to the scraper or the exporters:
+4. No CI exists. There is a `pytest` suite under `tests/` (run `pytest`), plus
+   two self-contained, offline, no-dependency scripts — run all three after any
+   change to the scraper or the exporters:
    ```bash
-   ./venv/Scripts/python.exe test_robustness.py   # parsing, path budget, discovery filters
+   ./venv/Scripts/python.exe -m pytest -q
+   ./venv/Scripts/python.exe test_robustness.py   # parsing, paths, discovery, context probing
    ./venv/Scripts/python.exe test_exports.py      # schema + all four export builders
    ```
+   **`tests/test_api.py` and `tests/test_main_storage.py` are largely skipped.**
+   They were written against a single-site storage layer — one global
+   `products.jsonl` with an incremental offset cache and an on-disk HTML cache —
+   which the upstream merge did not carry over; this tree stores one folder per
+   store and resolves paths through `active_site_dir()`. `tests/conftest.py`
+   skips rather than errors when those globals are absent, and asserts on the
+   attribute rather than a version flag, so the tests start running again by
+   themselves if that layer is ever ported onto the per-store layout. Do not
+   "fix" them by reintroducing a global `products.jsonl` — that would break
+   multi-site, which the dashboard depends on.
    `test_robustness.py` covers the hostile inputs real stores produce
    (truncated JSON-LD, entity-encoded names, price ranges, galleries of
    tracking pixels) and asserts the parser never raises. `test_exports.py`

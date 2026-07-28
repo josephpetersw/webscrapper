@@ -117,11 +117,35 @@ def _loads_lenient(text):
         return None
 
 
-def jsonld_nodes(soup):
+_LD_SCRIPT_RE = re.compile(
+    r'<script[^>]*type\s*=\s*["\']?[^"\'>]*ld\+json[^"\'>]*["\']?[^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL)
+
+
+def _ld_payloads(soup, raw_html=None):
+    """Raw text of every JSON-LD block on the page.
+
+    Normally BeautifulSoup finds these. But lxml silently discards *everything*
+    after ``</html>``, and real pages do emit trailing markup there — caching
+    and analytics plugins append to the very end of the response, and a
+    truncated or malformed document earlier on can push the footer out too.
+    Losing a store's structured data to that is the exact silent failure this
+    module exists to prevent, so when the parsed document yields nothing and
+    the raw response clearly holds a block, fall back to scanning the text.
+    """
+    payloads = [tag.string or tag.get_text() or ''
+                for tag in soup.find_all('script',
+                                         type=lambda t: t and 'ld+json' in t.lower())]
+    if payloads or not raw_html or 'ld+json' not in raw_html.lower():
+        return payloads
+    return _LD_SCRIPT_RE.findall(raw_html)
+
+
+def jsonld_nodes(soup, raw_html=None):
     """Every JSON-LD node on the page, with @graph containers flattened out."""
     nodes = []
-    for tag in soup.find_all('script', type=lambda t: t and 'ld+json' in t.lower()):
-        data = _loads_lenient(tag.string or tag.get_text() or '')
+    for payload in _ld_payloads(soup, raw_html):
+        data = _loads_lenient(payload)
         if data is None:
             continue
         stack = [data]

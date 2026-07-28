@@ -282,7 +282,9 @@ class Parser:
     @staticmethod
     def _parse_product_inner(html_content, url):
         soup = BeautifulSoup(html_content, 'lxml')
-        nodes = ex.jsonld_nodes(soup)
+        # The raw response is handed over too: lxml drops anything after
+        # </html>, which is where some sites put their structured data.
+        nodes = ex.jsonld_nodes(soup, html_content)
         product = ex.jsonld_product(nodes) or {}
         origin = url or ''
         sources = {}

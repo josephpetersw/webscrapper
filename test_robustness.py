@@ -228,6 +228,42 @@ check('no dominant shape returns nothing',
           [f'https://x.com/b/{i}' for i in range(10)], 'x.com') == [])
 check('too few urls returns nothing', disc._infer_product_urls(catalogue[:3], 'x.com') == [])
 
+print('\n== Fulfilment-context probing ==')
+from scraper import client as client_mod
+
+check('params appended to a bare url',
+      client_mod.with_params('https://x.com/p/1', {'sid': 'SLOTTED'})
+      == 'https://x.com/p/1?sid=SLOTTED')
+check('existing query preserved',
+      client_mod.with_params('https://x.com/p/1?a=2', {'sid': 'SLOTTED'})
+      in ('https://x.com/p/1?a=2&sid=SLOTTED', 'https://x.com/p/1?sid=SLOTTED&a=2'))
+check('same key overridden, not duplicated',
+      client_mod.with_params('https://x.com/p?sid=OLD', {'sid': 'NEW'})
+      == 'https://x.com/p?sid=NEW')
+check('no params is a no-op',
+      client_mod.with_params('https://x.com/p/1', {}) == 'https://x.com/p/1')
+check('values are url-encoded',
+      '%20' in client_mod.with_params('https://x.com/p', {'k': 'a b'})
+      or '+' in client_mod.with_params('https://x.com/p', {'k': 'a b'}))
+
+memo = client_mod._ContextMemo()
+check('a fresh host offers every candidate',
+      len(memo.candidates('a.test')) == len(client_mod.PRICE_CONTEXT_PARAMS))
+memo.remember('a.test', {'sid': 'SLOTTED'})
+check('a solved host offers only the known answer',
+      memo.candidates('a.test') == [{'sid': 'SLOTTED'}])
+
+memo2 = client_mod._ContextMemo()
+memo2.settle('b.test')
+check('a host that prices normally is never probed', memo2.candidates('b.test') == [])
+
+memo3 = client_mod._ContextMemo()
+probes = sum(1 for _ in range(client_mod._CONTEXT_PROBE_LIMIT + 3)
+             if memo3.candidates('c.test'))
+check('probing stops after the limit so sold-out stores are not re-probed',
+      probes == client_mod._CONTEXT_PROBE_LIMIT, probes)
+check('host with no name is never probed', client_mod._ContextMemo().candidates('') == [])
+
 print('\n== Filesystem path budget ==')
 import os
 from scraper import paths as pu
