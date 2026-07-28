@@ -145,6 +145,50 @@ def _is_scrapable_page(url, host=None):
     return not _is_archive_root(url)
 
 
+def _product_urls_in(urls, host=None):
+    """The URLs in a sitemap that actually look like product pages.
+
+    A sitemap's *filename* is a hint, not evidence. A store can publish a
+    single 'sitemap.xml' listing nothing but its About, Contact and brand-filter
+    pages; taking the file at face value reported "product sitemap found" and
+    then scraped those marketing pages as though they were the catalogue.
+    """
+    hits = [u for u in urls
+            if _is_scrapable_page(u, host)
+            and any(h in u.lower() for h in PRODUCT_URL_HINTS)]
+    # Nothing matched a known product path; let the dominant URL shape decide,
+    # which returns [] rather than guessing when no shape dominates.
+    return hits or _infer_product_urls(urls, host)
+
+
+# Below this much visible text a "page" is a JavaScript shell, not content.
+_MIN_SERVER_RENDERED_TEXT = 600
+_SCRIPT_STYLE = re.compile(r'<(script|style|noscript)\b[^>]*>.*?</\1\s*>', re.I | re.S)
+_HTML_TAGS = re.compile(r'<[^>]+>')
+
+
+def visible_text_length(html):
+    """Roughly how much text a reader would see, scripts and markup removed."""
+    if not html:
+        return 0
+    text = _HTML_TAGS.sub(' ', _SCRIPT_STYLE.sub(' ', html))
+    return len(re.sub(r'\s+', ' ', text).strip())
+
+
+def looks_client_rendered(html):
+    """True if this page is a JS shell that fetches its content after load.
+
+    A React or Vue storefront serves a near-empty body and renders everything
+    client-side, so there is nothing for the parser to read *and* nothing for a
+    listing crawl to follow. Worth saying up front: the run would otherwise
+    look healthy while returning marketing pages and no products.
+    """
+    if not html:
+        return False
+    return (visible_text_length(html) < _MIN_SERVER_RENDERED_TEXT
+            and html.lower().count('<script') >= 5)
+
+
 def _infer_product_urls(urls, host=None):
     """Pick the product URLs out of a whole-site sitemap by shape.
 
@@ -622,6 +666,7 @@ def analyze_site(client, parser, url):
                               if l.strip().lower().startswith('sitemap:')][:10]
 
     # One sitemap fetch to enumerate the children without downloading them all
+    host = urlparse(base).netloc.lower()
     index_url = report['sitemaps'][0] if report['sitemaps'] else f"{base}/sitemap_index.xml"
     xml = client.fetch_page(index_url, retries=1)
     if xml:
@@ -634,7 +679,18 @@ def analyze_site(client, parser, url):
                 if any(h in c.lower() for h in PRODUCT_SITEMAP_HINTS)
                 and not any(t in c.lower() for t in TAXONOMY_SITEMAP_HINTS)]
         elif children:
-            report['product_sitemaps'] = [index_url]
+            # Not an index: this file lists pages directly, so we can check
+            # rather than assume. Claiming it as a product sitemap on the
+            # strength of it being non-empty is what let a 14-entry sitemap of
+            # About/Contact/brand-filter pages read as a catalogue.
+            found = _product_urls_in(children, host)
+            if found:
+                report['product_sitemaps'] = [index_url]
+                report['estimated_products'] = len(found)
+            else:
+                report['notes'].append(
+                    f"{index_url} lists {len(children)} URL(s), none of which look like "
+                    f"product pages.")
 
     if report['product_sitemaps']:
         report['strategy'] = 'sitemap'
@@ -700,5 +756,16 @@ def analyze_site(client, parser, url):
         report['warnings'].append(
             'No product sitemap or API found. Products will be discovered by crawling listing '
             'pages, which is slower and may miss items.')
+
+    # Checked last so it can override the advice above: on a JS storefront a
+    # listing crawl has nothing to follow either, and the run would finish
+    # "successfully" with a handful of marketing pages and no products.
+    if looks_client_rendered(homepage):
+        report['client_rendered'] = True
+        report['warnings'].append(
+            'This storefront renders its pages in the browser: the HTML the server returns is an '
+            'empty shell, so it carries no product data and no product links. Scraping it needs '
+            'the JSON API the page itself calls (find it in the browser\'s Network tab) or a '
+            'headless browser. A run started now would return the site\'s static pages only.')
 
     return report

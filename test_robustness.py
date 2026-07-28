@@ -218,6 +218,40 @@ check('product behind a front controller kept',
 check('product whose slug merely starts with shop is kept',
       disc._is_scrapable_page('https://x.com/shopping-trolley-large/'))
 
+# A sitemap's filename is a hint, not evidence. A live store published a
+# 14-entry sitemap.xml of About/Contact/brand-filter pages; the pre-scrape
+# dialog reported 'Product sitemaps: 1 found' and a run would have stored
+# eight marketing pages as products.
+MARKETING_ONLY = [
+    'https://z.co.ke/', 'https://z.co.ke/get-started', 'https://z.co.ke/download',
+    'https://z.co.ke/brands', 'https://z.co.ke/brands?brand=Vivo',
+    'https://z.co.ke/brands?brand=Tecno', 'https://z.co.ke/brands?brand=Itel',
+    'https://z.co.ke/about', 'https://z.co.ke/contact', 'https://z.co.ke/faqs',
+    'https://z.co.ke/legal/privacy', 'https://z.co.ke/legal/terms',
+]
+check('marketing-only sitemap yields no products',
+      disc._product_urls_in(MARKETING_ONLY, 'z.co.ke') == [],
+      disc._product_urls_in(MARKETING_ONLY, 'z.co.ke'))
+check('a real product sitemap still yields its products',
+      len(disc._product_urls_in(
+          [f'https://x.com/product/item-{i}/' for i in range(8)], 'x.com')) == 8)
+check('mixed sitemap keeps only the product URLs',
+      disc._product_urls_in(
+          ['https://x.com/about', 'https://x.com/contact'] +
+          [f'https://x.com/product/p{i}/' for i in range(6)], 'x.com')
+      == [f'https://x.com/product/p{i}/' for i in range(6)])
+
+print('\n== Client-rendered storefront detection ==')
+JS_SHELL = ('<html><head>' + '<script src="/assets/index-abc.js"></script>' * 6 +
+            '</head><body><div id="root"></div><noscript>You need JavaScript'
+            '</noscript></body></html>')
+check('js shell detected', disc.looks_client_rendered(JS_SHELL))
+check('server-rendered page not flagged',
+      not disc.looks_client_rendered(WOO + '<p>' + 'real product copy. ' * 60 + '</p>'))
+check('empty html is not flagged', not disc.looks_client_rendered(''))
+check('script contents do not count as visible text',
+      disc.visible_text_length('<script>' + 'x' * 5000 + '</script><p>hi</p>') == 2)
+
 catalogue = [f'https://x.com/catalogue/item-{i}_{i}/' for i in range(40)]
 noise = ['https://x.com/about', 'https://x.com/contact-us']
 check('dominant shape inferred',
